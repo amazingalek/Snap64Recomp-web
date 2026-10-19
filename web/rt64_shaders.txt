@@ -2,6 +2,7 @@
 # the boot to the main menu (section 0), the main menu, then a section a course, each started from the main menu by
 # web/survey.cpp and ridden to its end by web/shader_survey.js (the camera out, photos taken, the items thrown), and
 # the screens after a course (the camera check, Oak's report), reached through a ride of the beach left out.
+# The last three are ones Firefox plays missed (play_page.mjs's "shader missed" lines), added by hand.
 00504240 00002c3f fc11fe23 fffff3f9 04cb540b
 c8112078 0018ac3f fc1217ff fffffe38 0803540e
 c8112078 0018ac3f fc1217ff fffffe38 0ccb540e
@@ -510,3 +511,4 @@ c8113079 0098ac0f fc127fff fffff238 0803540e
 004049dd 00002c0f fc30b261 5566db6d 0ccb540b
 00504240 00002c0f fc11fe23 fffff3f9 04cb540b
 00504240 00002c0f fc11fe23 fffff3f9 0ccb540b
+00504240 00002c0f fc119623 ff2fffff 04cb540b
