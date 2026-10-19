@@ -1,0 +1,765 @@
+diff --git b/librecomp/src/mods.cpp a/librecomp/src/mods.cpp
+index 037f15f..deb40e5 100644
+--- b/librecomp/src/mods.cpp
++++ a/librecomp/src/mods.cpp
+@@ -75,6 +75,9 @@ bool get_to_vec(const nlohmann::json& val, std::vector<T2>& out) {
+ // MSVC/GCC/Clang ARM64
+ #elif defined(__ARM_ARCH_ISA_A64)
+ #   define IS_ARM64
++// WebAssembly: code can't be patched or generated at runtime.
++#elif defined(__wasm__)
++#   define IS_WASM
+ #else
+ #   error "Unsupported architecture!"
+ #endif
+@@ -455,7 +458,9 @@ void recomp::mods::DynamicLibraryCodeHandle::set_imported_function(size_t import
+     }, func);
+ }
+ 
+-recomp::mods::CodeModLoadError recomp::mods::DynamicLibraryCodeHandle::populate_reference_symbols(const N64Recomp::Context& context, std::string& error_param) {
++// Fills a mod's array of the base ROM's functions it calls, for code recompiled ahead of time (a DLL, or linked in).
++static recomp::mods::CodeModLoadError populate_reference_symbol_funcs(const N64Recomp::Context& context, recomp_func_t** reference_symbol_funcs, std::string& error_param) {
++    using namespace recomp::mods;
+     size_t reference_symbol_index = 0;
+     for (const auto& section : context.sections) {
+         for (const auto& reloc : section.relocs) {
+@@ -477,10 +482,35 @@ recomp::mods::CodeModLoadError recomp::mods::DynamicLibraryCodeHandle::populate_
+     return CodeModLoadError::Good;
+ }
+ 
++recomp::mods::CodeModLoadError recomp::mods::DynamicLibraryCodeHandle::populate_reference_symbols(const N64Recomp::Context& context, std::string& error_param) {
++    return populate_reference_symbol_funcs(context, reference_symbol_funcs, error_param);
++}
++
++recomp::mods::PrecompiledCodeHandle::PrecompiledCodeHandle(const recomp_precompiled_mod& code, const N64Recomp::Context& context, const ModCodeHandleInputs& inputs) : code(code) {
++    is_good = code.num_functions == context.functions.size();
++    *code.base_event_index = inputs.base_event_index;
++    *code.reference_section_addresses = inputs.reference_section_addresses;
++}
++
++void recomp::mods::PrecompiledCodeHandle::set_imported_function(size_t import_index, GenericFunction func) {
++    std::visit(overloaded {
++        [this, import_index](recomp_func_t* native_func) {
++            code.imported_funcs[import_index] = native_func;
++        }
++    }, func);
++}
++
++recomp::mods::CodeModLoadError recomp::mods::PrecompiledCodeHandle::populate_reference_symbols(const N64Recomp::Context& context, std::string& error_param) {
++    return populate_reference_symbol_funcs(context, code.reference_symbol_funcs, error_param);
++}
++
+ recomp::mods::LiveRecompilerCodeHandle::LiveRecompilerCodeHandle(
+     const N64Recomp::Context& context, const ModCodeHandleInputs& inputs,
+     std::unordered_map<size_t, size_t>&& entry_func_hooks, std::unordered_map<size_t, size_t>&& return_func_hooks, std::vector<size_t>&& original_section_indices, bool regenerated)
+ {
++#ifdef IS_WASM
++    is_good = false;
++#else
+     if (!regenerated) {
+        section_addresses = std::make_unique<int32_t[]>(context.sections.size());
+     }
+@@ -549,17 +579,23 @@ recomp::mods::LiveRecompilerCodeHandle::LiveRecompilerCodeHandle(
+             ultramodern::register_generated_code(generated_elsewhere, recompiler_output->code_size);
+         }
+     }
++#endif
+ }
+ 
+ recomp::mods::LiveRecompilerCodeHandle::~LiveRecompilerCodeHandle() {
++#ifndef IS_WASM
+     if (recompiler_output != nullptr && recompiler_output->code != nullptr) {
+         ultramodern::unregister_generated_code(recompiler_output->code);
+     }
+     if (generated_elsewhere != nullptr) {
+         ultramodern::unregister_generated_code(generated_elsewhere);
+     }
++#endif
+ }
+ 
++// Without a live recompiler a handle is never good, so the functions below are never called.
++#ifndef IS_WASM
++
+ void recomp::mods::LiveRecompilerCodeHandle::set_imported_function(size_t import_index, GenericFunction func) {
+     std::visit(overloaded {
+         [this, import_index](recomp_func_t* native_func) {
+@@ -591,8 +627,135 @@ recomp::mods::CodeModLoadError recomp::mods::LiveRecompilerCodeHandle::populate_
+ recomp::mods::GenericFunction recomp::mods::LiveRecompilerCodeHandle::get_function_handle(size_t func_index) {
+     return GenericFunction{ recompiler_output->functions[func_index] };
+ }
++#else
++void recomp::mods::LiveRecompilerCodeHandle::set_imported_function(size_t, GenericFunction) {}
++
++recomp::mods::CodeModLoadError recomp::mods::LiveRecompilerCodeHandle::populate_reference_symbols(const N64Recomp::Context&, std::string&) {
++    return CodeModLoadError::Good;
++}
++
++recomp::mods::GenericFunction recomp::mods::LiveRecompilerCodeHandle::get_function_handle(size_t) {
++    return GenericFunction{ static_cast<recomp_func_t*>(nullptr) };
++}
++
++// LiveRecomp, which generates these, isn't linked. Nothing creates one, but librecomp still names it.
++N64Recomp::LiveGeneratorOutput::~LiveGeneratorOutput() {}
++
++// A shim calls a function that takes a value (recomp_func_ext_t) from a call that passes none (recomp_func_t): the
++// config API given the calling mod's index, for one. LiveRecomp generates each one as code, so here they're the slots
++// of a fixed pool of functions, each of which calls what its slot holds. `code` points at the slot.
++namespace {
++    struct ShimSlot {
++        recomp_func_ext_t* func;
++        uintptr_t value;
++    };
++    constexpr size_t num_shim_slots = 1024;
++    ShimSlot shim_slots[num_shim_slots]{};
++    std::mutex shim_slots_mutex;
++
++    template <size_t index>
++    void shim_slot_func(uint8_t* rdram, recomp_context* ctx) {
++        shim_slots[index].func(rdram, ctx, shim_slots[index].value);
++    }
++
++    template <size_t... indices>
++    constexpr std::array<recomp_func_t*, sizeof...(indices)> make_shim_slot_funcs(std::index_sequence<indices...>) {
++        return { shim_slot_func<indices>... };
++    }
++    constexpr std::array<recomp_func_t*, num_shim_slots> shim_slot_funcs = make_shim_slot_funcs(std::make_index_sequence<num_shim_slots>{});
++}
++
++N64Recomp::ShimFunction::ShimFunction(recomp_func_ext_t* to_shim, uintptr_t value) : code(nullptr), func(nullptr) {
++    std::lock_guard lock{ shim_slots_mutex };
++    for (size_t i = 0; i < num_shim_slots; i++) {
++        if (shim_slots[i].func == nullptr) {
++            shim_slots[i] = ShimSlot{ to_shim, value };
++            code = &shim_slots[i];
++            func = shim_slot_funcs[i];
++            return;
++        }
++    }
++    assert(false && "Out of shim slots");
++}
++
++N64Recomp::ShimFunction::~ShimFunction() {
++    std::lock_guard lock{ shim_slots_mutex };
++    if (code != nullptr) {
++        static_cast<ShimSlot*>(code)->func = nullptr;
++    }
++}
++#endif
++
++#if defined(IS_WASM)
++// WebAssembly can't rewrite a function's code, so there a mod's replacement of a recompiled function (patch_func) and
++// the hooks the live recompiler would add to a copy of it are kept here, and every recompiled function asks at its entry
++// (RECOMP_FUNC_ENTRY in recomp.h): a byte per function table index, which is a function pointer's value, set for one
++// with a redirect, and what to run for it.
++extern "C" const uint8_t* recomp_redirected = nullptr;
++extern "C" uintptr_t recomp_redirected_count = 0;
++
++namespace {
++    struct Redirect {
++        recomp_func_t* replacement = nullptr;
++        size_t entry_hook = SIZE_MAX;
++        size_t return_hook = SIZE_MAX;
++    };
++    std::vector<uint8_t> redirected_funcs;
++    std::unordered_map<uintptr_t, Redirect> redirects;
++    // A hooked function that recomp_redirect has called, to run itself when its entry asks.
++    thread_local uintptr_t redirect_bypass = 0;
++
++    // Only while mods load, before the game's threads run.
++    Redirect& add_redirect(recomp_func_t* func) {
++        uintptr_t index = reinterpret_cast<uintptr_t>(func);
++        if (index >= redirected_funcs.size()) {
++            redirected_funcs.resize(index + 1);
++        }
++        redirected_funcs[index] = 1;
++        recomp_redirected = redirected_funcs.data();
++        recomp_redirected_count = redirected_funcs.size();
++        return redirects[index];
++    }
++
++    void reset_redirects() {
++        recomp_redirected_count = 0;
++        recomp_redirected = nullptr;
++        redirected_funcs.clear();
++        redirects.clear();
++    }
++}
++
++extern "C" int recomp_redirect(uint8_t* rdram, recomp_context* ctx, uintptr_t func) {
++    if (redirect_bypass == func) {
++        redirect_bypass = 0;
++        return 0;
++    }
++    auto find_it = redirects.find(func);
++    if (find_it == redirects.end()) {
++        return 0;
++    }
++    const Redirect& redirect = find_it->second;
++    if (redirect.entry_hook != SIZE_MAX) {
++        recomp::mods::run_hook(rdram, ctx, redirect.entry_hook);
++    }
++    if (redirect.replacement != nullptr) {
++        redirect.replacement(rdram, ctx);
++    }
++    else {
++        redirect_bypass = func;
++        reinterpret_cast<recomp_func_t*>(func)(rdram, ctx);
++    }
++    if (redirect.return_hook != SIZE_MAX) {
++        recomp::mods::run_hook(rdram, ctx, redirect.return_hook);
++    }
++    return 1;
++}
++#endif
+ 
+ void patch_func(recomp_func_t* target_func, recomp::mods::GenericFunction replacement_func) {
++#if defined(IS_WASM)
++    add_redirect(target_func).replacement = std::get<recomp_func_t*>(replacement_func);
++#else
+     uint8_t* target_func_u8 = reinterpret_cast<uint8_t*>(target_func);
+     size_t offset = 0;
+ 
+@@ -627,13 +790,20 @@ void patch_func(recomp_func_t* target_func, recomp::mods::GenericFunction replac
+ #endif
+ 
+     protect(target_func_u8, old_flags);
++#endif
+ }
+ 
+ void unpatch_func(void* target_func, const recomp::mods::PatchData& data) {
++#if defined(IS_WASM)
++    // unload_mods drops every redirect at once.
++    (void)target_func;
++    (void)data;
++#else
+     uint64_t old_flags;
+     unprotect(target_func, &old_flags);
+     memcpy(target_func, data.replaced_bytes.data(), data.replaced_bytes.size());
+     protect(target_func, old_flags);
++#endif
+ }
+ 
+ void recomp::mods::ModContext::add_opened_mod(ModManifest&& manifest, config::Config&& config, std::vector<size_t>&& game_indices, std::vector<ModContentTypeId>&& detected_content_types, std::vector<char>&& thumbnail) {
+@@ -673,6 +843,10 @@ void recomp::mods::ModContext::register_embedded_mod(const std::string &mod_id,
+     embedded_mod_bytes.emplace(mod_id, mod_bytes);
+ }
+ 
++void recomp::mods::ModContext::register_precompiled_mod(const recomp_precompiled_mod& code) {
++    precompiled_mods.emplace(code.hash, &code);
++}
++
+ void recomp::mods::ModContext::register_deprecated_mod(const std::string& mod_id, DeprecationStatus deprecation_status, const Version &maximum_version) {
+     deprecated_mods[mod_id].status = deprecation_status;
+     deprecated_mods[mod_id].maximum_version = maximum_version;
+@@ -2082,6 +2256,23 @@ std::vector<recomp::mods::ModLoadErrorDetails> build_regen_list(
+     return {};
+ }
+ 
++#if defined(IS_WASM)
++// In WebAssembly a hooked function isn't regenerated with its hooks: recomp_redirect runs them around it.
++void redirect_hooks(const RegeneratedList& regenlist) {
++    for (size_t func_index = 0; func_index < regenlist.func_ptrs.size(); func_index++) {
++        Redirect& redirect = add_redirect(regenlist.func_ptrs[func_index]);
++        auto find_entry_it = regenlist.entry_func_hooks.find(func_index);
++        if (find_entry_it != regenlist.entry_func_hooks.end()) {
++            redirect.entry_hook = find_entry_it->second;
++        }
++        auto find_return_it = regenlist.return_func_hooks.find(func_index);
++        if (find_return_it != regenlist.return_func_hooks.end()) {
++            redirect.return_hook = find_return_it->second;
++        }
++    }
++}
++#endif
++
+ std::unique_ptr<recomp::mods::LiveRecompilerCodeHandle> apply_regenlist(RegeneratedList& regenlist, std::span<const uint8_t> rom) {
+     using namespace recomp::mods;
+ 
+@@ -2150,6 +2341,9 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::regener
+ 
+     // Apply the regenlist.
+     if (!regenlist.functions.empty()) {
++#if defined(IS_WASM)
++        redirect_hooks(regenlist);
++#else
+         regenerated_code_handle = apply_regenlist(regenlist, decompressed_rom);
+         if (!regenerated_code_handle || !regenerated_code_handle->good()) {
+             regenerated_code_handle.reset();
+@@ -2158,6 +2352,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::regener
+             });
+             return ret;
+         }
++#endif
+     }
+ 
+     if (!regenlist.patched_hooks.empty()) {
+@@ -2198,6 +2393,9 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::regener
+         }
+ 
+         // Apply the patched function regenlist.
++#if defined(IS_WASM)
++        redirect_hooks(patch_regenlist);
++#else
+         base_patched_code_handle = apply_regenlist(patch_regenlist, overlays::get_patch_binary());
+         if (!base_patched_code_handle || !base_patched_code_handle->good()) {
+             regenerated_code_handle.reset();
+@@ -2207,6 +2405,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::regener
+             });
+             return ret;
+         }
++#endif
+     }
+ 
+     return ret;
+@@ -2264,6 +2463,10 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::init_mod_code(uint8_t*
+ 
+     std::span<uint8_t> binary_span {reinterpret_cast<uint8_t*>(binary_data.data()), binary_data.size() };
+ 
++    // Use this mod's code recompiled ahead of time if the recomp has it.
++    auto find_precompiled_it = precompiled_mods.find(N64Recomp::mod_code_hash(binary_span, syms_data));
++    mod.precompiled_code = find_precompiled_it != precompiled_mods.end() ? find_precompiled_it->second : nullptr;
++
+     // Parse the symbol file into the recompiler context.
+     N64Recomp::ModSymbolsError symbol_load_error = N64Recomp::parse_mod_symbols(syms_data, binary_span, section_vrom_map, *mod.recompiler_context);
+     if (symbol_load_error != N64Recomp::ModSymbolsError::Good) {
+@@ -2435,17 +2638,31 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::load_mod_code(uint8_t*
+         .reference_section_addresses = section_addresses,
+     };
+ 
++    // Code recompiled ahead of time and linked in (register_precompiled_mod).
++    if (mod.precompiled_code != nullptr) {
++        // Hooks can't be added to it either.
++        if (!entry_func_hooks.empty() || !return_func_hooks.empty()) {
++            return CodeModLoadError::OfflineModHooked;
++        }
++
++        mod.code_handle = std::make_unique<PrecompiledCodeHandle>(*mod.precompiled_code, *mod.recompiler_context, handle_inputs);
++        if (!mod.code_handle->good()) {
++            mod.code_handle.reset();
++            error_param = mod.manifest.mod_id;
++            return CodeModLoadError::FailedToLoadNativeCode;
++        }
++    }
+     // Use a dynamic library code handle. This feature isn't meant to be used by end users, but provides a more debuggable
+     // experience than the live recompiler for mod developers.
+     // Enabled if the mod's filename ends with ".offline.nrm".
+     // Snap64 Recomp: refused. An offline-recompiled mod is a native library
+     // beside the .nrm, opened on the computer; mods are N64 code only, and
+     // every mod goes through the live recompiler.
+-    if (mod.manifest.mod_root_path.filename().string().ends_with(".offline.nrm")) {
++    else if (mod.manifest.mod_root_path.filename().string().ends_with(".offline.nrm")) {
+         error_param = mod.manifest.mod_root_path.filename().string();
+         return CodeModLoadError::OfflineModRefused;
+     }
+-    if (false) {
++    else if (false) {
+         // Hooks can't be generated for native mods, so return an error if any of the functions this mod replaces are also hooked by another mod.
+         if (!entry_func_hooks.empty() || !return_func_hooks.empty()) {
+             return CodeModLoadError::OfflineModHooked;
+@@ -2714,7 +2931,9 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::resolve_code_dependenci
+ 
+         // Copy the original bytes so they can be restored later after the mod is unloaded.
+         PatchData& cur_replacement_data = patched_funcs[to_replace];
++#if !defined(IS_WASM)
+         memcpy(cur_replacement_data.replaced_bytes.data(), reinterpret_cast<void*>(to_replace), cur_replacement_data.replaced_bytes.size());
++#endif
+         cur_replacement_data.mod_id = mod.manifest.mod_id;
+ 
+         // Patch the function to redirect it to the replacement.
+@@ -2729,6 +2948,9 @@ void recomp::mods::ModContext::unload_mods() {
+         unpatch_func(reinterpret_cast<void*>(replacement_func), replacement_data);
+     }
+     patched_funcs.clear();
++#if defined(IS_WASM)
++    reset_redirects();
++#endif
+     loaded_mods_by_id.clear();
+     hook_slots.clear();
+     processed_hook_slots.clear();
+diff --git b/ultramodern/CMakeLists.txt a/ultramodern/CMakeLists.txt
+index 59acf58..011b0c1 100644
+--- b/ultramodern/CMakeLists.txt
++++ a/ultramodern/CMakeLists.txt
+@@ -40,3 +40,16 @@ if (WIN32)
+ endif()
+ 
+ 
++# osStopThread on another thread, and osStartThread on a thread stopped while it waited on a message queue, as libultra
++# does them (threads.cpp); without it, stopping another thread asserts.
++option(ULTRAMODERN_LIBULTRA_THREAD_STOP "osStopThread/osStartThread on another thread as libultra does them (always on with Emscripten)" OFF)
++if (ULTRAMODERN_LIBULTRA_THREAD_STOP OR EMSCRIPTEN)
++    target_compile_definitions(ultramodern PRIVATE ULTRAMODERN_LIBULTRA_THREAD_STOP=1)
++endif()
++
++# An external message whose queue is full and that is to be sent again waits in a list of its own, tried again first at
++# the next OS call or idle wait, instead of going back into the queue the idle thread spins on (mesgqueue.cpp).
++option(ULTRAMODERN_HOLD_BLOCKED_MESSAGES "A blocked external message held in a list, not requeued (always on with Emscripten)" OFF)
++if (ULTRAMODERN_HOLD_BLOCKED_MESSAGES OR EMSCRIPTEN)
++    target_compile_definitions(ultramodern PRIVATE ULTRAMODERN_HOLD_BLOCKED_MESSAGES=1)
++endif()
+diff --git b/ultramodern/src/events.cpp a/ultramodern/src/events.cpp
+index a2fc449..ae9ee82 100644
+--- b/ultramodern/src/events.cpp
++++ a/ultramodern/src/events.cpp
+@@ -182,6 +182,98 @@ uint64_t total_vis = 0;
+ 
+ 
+ extern std::atomic_bool exited;
++
++#if defined(__EMSCRIPTEN_PTHREADS__)
++#include <algorithm>
++#include <climits>
++#include <cstdio>
++#include <emscripten/emscripten.h>
++#include <emscripten/html5.h>
++#include <emscripten/proxying.h>
++#include <emscripten/threading.h>
++
++// On a page the VI thread's timed sleep can end long after the VI's time: in Firefox on Windows every timed wait off the
++// page's thread ends on the system timer's tick (15.6 ms unless the browser's process asks for a finer one), so VIs came
++// 15.6 or 31.2 ms apart instead of 16.7. RT64 reads a game's rate from how many VIs each of its frames was shown for,
++// and from those it read GoldenEye, a new frame at nearly every VI, as a game at 30 about 5 times a second, made two
++// presents of each of those frames, and presented 63-64 a second on a 60 Hz display. So where a timed wait ends late,
++// the VI thread waits for the browser's animation frames, whose futex wake comes at once, and a VI comes at the first
++// frame less than half a VI before its time: on a 60 Hz display every VI is a frame apart. A timed wait to the VI's time
++// stays as the fallback, for a page whose frames have stopped (hidden). Elsewhere (Chrome, a finer timer) the VI thread
++// sleeps as before.
++// It sits up here, apart from vi_thread_func, because a recomp's own patch to the VI thread adds its state just above
++// that function (CBFD-Recompiled's remaining_retraces), and a block there kept such a patch from applying.
++namespace {
++    // Whether a timed wait off the page's thread ends late: three waits of 100 us, late if the shortest took more than
++    // 4 ms (plume's timedWaitsEndLate() measures the same).
++    bool vi_waits_end_late() {
++        static const bool late = []() {
++            uint32_t futex = 0;
++            double shortest = 1e9;
++            for (int i = 0; i < 3; i++) {
++                const double start = emscripten_get_now();
++                emscripten_futex_wait(&futex, 0, 0.1);
++                shortest = std::min(shortest, emscripten_get_now() - start);
++            }
++
++            return shortest > 4.0;
++        }();
++
++        return late;
++    }
++
++    // The browser's animation frames, counted on the page's thread: a futex woken at each. Only the count crosses
++    // threads: the VI thread times a frame by when its wake reaches it, since a time read on the page's thread and one
++    // read on another don't agree in Firefox (each context's own performance.timeOrigin), and comparing them sent VIs
++    // 1,500-1,800 a second. Firefox also calls back 0.1-5 ms after a frame now and then, which isn't a frame of the display.
++    std::atomic<uint32_t> vi_frame_serial{ 0 };
++
++    bool vi_animation_frame(double, void*) {
++        static double last = 0.0;
++        const double now = emscripten_get_now();
++        if ((now - last) >= 5.0) {
++            last = now;
++            vi_frame_serial++;
++            emscripten_futex_wake(&vi_frame_serial, INT_MAX);
++        }
++
++        return true;
++    }
++
++    void vi_start_frames(void*) {
++        emscripten_request_animation_frame_loop(vi_animation_frame, nullptr);
++    }
++
++    // Holds the VI thread until about the given time, ending on the first animation frame to come less than half a VI
++    // before it, or at the time if none comes by then. False where a timed wait ends on time, and the caller sleeps itself.
++    bool vi_sleep_until(const std::chrono::high_resolution_clock::time_point& time_point) {
++        if (!vi_waits_end_late()) {
++            return false;
++        }
++
++        [[maybe_unused]] static const bool started = []() {
++            emscripten_proxy_async(emscripten_proxy_get_system_queue(), emscripten_main_runtime_thread_id(), vi_start_frames, nullptr);
++            fprintf(stderr, "ultramodern: timed waits end late on this page, so VIs come on the browser's animation frames\n");
++            return true;
++        }();
++
++        const double end = emscripten_get_now() + std::chrono::duration<double, std::milli>(time_point - std::chrono::high_resolution_clock::now()).count();
++        const double from = end - 1000.0 / (2 * 60 * ultramodern::get_speed_multiplier());
++        uint32_t serial = vi_frame_serial;
++        for (;;) {
++            const double now = emscripten_get_now();
++            const uint32_t current = vi_frame_serial;
++            if ((now >= end) || ((current != serial) && (now >= from))) {
++                return true;
++            }
++
++            serial = current;
++            emscripten_futex_wait(&vi_frame_serial, serial, end - now);
++        }
++    }
++}
++#endif
++
+ extern moodycamel::LightweightSemaphore graphics_shutdown_ready;
+ 
+ void set_dummy_vi(bool odd);
+@@ -231,10 +323,25 @@ void vi_thread_func() {
+             // printf("Skipping the next VI wait\n");
+             next = std::chrono::high_resolution_clock::now();
+         }
++#if defined(__EMSCRIPTEN_PTHREADS__)
++        // A VI that ended on a frame leaves the timed wait below nothing to wait for. That wait stays where it was, so
++        // a recomp's own patches to this loop still apply.
++        const bool vi_on_frame = vi_sleep_until(next);
++        if (vi_on_frame) {
++            next = std::chrono::high_resolution_clock::now();
++        }
++#endif
+         ultramodern::sleep_until(next);
+         auto time_now = std::chrono::high_resolution_clock::now() - vi_origin;
+         // Calculate how many VIs have passed
+         uint64_t new_total_vis = vi_origin_vis + (time_now * (60 * vi_num) / (1000ms * vi_den)) + 1;
++#if defined(__EMSCRIPTEN_PTHREADS__)
++        // A VI that ended on a frame before its time is that VI all the same: counted from the time, it would be the one
++        // before it again, sent a second time at the next frame (VIs came 64-91 a second).
++        if (vi_on_frame) {
++            new_total_vis = std::max(new_total_vis, total_vis + 1);
++        }
++#endif
+         if (new_total_vis > total_vis + 1) {
+             //printf("Skipped % " PRId64 " frames in VI interupt thread!\n", new_total_vis - total_vis - 1);
+         }
+diff --git b/ultramodern/src/mesgqueue.cpp a/ultramodern/src/mesgqueue.cpp
+index 45e1e87..74003ce 100644
+--- b/ultramodern/src/mesgqueue.cpp
++++ a/ultramodern/src/mesgqueue.cpp
+@@ -16,6 +16,14 @@ struct QueuedMessage {
+     // Pokemon Snap port: a retrace or an audio tick, the messages the VI
+     // thread posts on a clock. See dequeue_external_messages.
+     bool periodic;
++#if ULTRAMODERN_HOLD_BLOCKED_MESSAGES
++    // A blocked external message waits in a list, not in the queue (below wait_for_external_message_timed).
++    static std::vector<QueuedMessage> blocked_messages;
++    static bool send_blocked_messages(RDRAM_ARG1);
++#define REQUEUE_BLOCKED_MESSAGE(mesg) QueuedMessage::blocked_messages.push_back(mesg)
++#else
++#define REQUEUE_BLOCKED_MESSAGE(mesg) external_messages.enqueue(mesg)
++#endif
+ };
+ 
+ static moodycamel::BlockingConcurrentQueue<QueuedMessage> external_messages {};
+@@ -46,6 +54,9 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block);
+ void dequeue_external_messages(RDRAM_ARG1) {
+     QueuedMessage to_send;
+     std::vector<QueuedMessage> requeued_messages{};
++#if ULTRAMODERN_HOLD_BLOCKED_MESSAGES
++    QueuedMessage::send_blocked_messages(PASS_RDRAM1);
++#endif
+     while (external_messages.try_dequeue(to_send)) {
+         // Pokemon Snap port: a periodic message -- a retrace, an audio tick --
+         // never takes the last free slot of its queue. These pile up here
+@@ -72,7 +83,7 @@ void dequeue_external_messages(RDRAM_ARG1) {
+         }
+     }
+     for (QueuedMessage& cur_mesg : requeued_messages) {
+-        external_messages.enqueue(cur_mesg);
++        REQUEUE_BLOCKED_MESSAGE(cur_mesg);
+     }
+ }
+ 
+@@ -84,25 +95,61 @@ extern "C" void snap_run_clock_resume();
+ 
+ void ultramodern::wait_for_external_message(RDRAM_ARG1) {
+     QueuedMessage to_send;
++#if ULTRAMODERN_HOLD_BLOCKED_MESSAGES
++    if (QueuedMessage::send_blocked_messages(PASS_RDRAM1)) {
++        return;
++    }
++#endif
+     snap_run_clock_pause();
+     external_messages.wait_dequeue(to_send);
+     snap_run_clock_resume();
+     if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
+-        external_messages.enqueue(to_send);
++        REQUEUE_BLOCKED_MESSAGE(to_send);
+     }
+ }
+ 
+ void ultramodern::wait_for_external_message_timed(RDRAM_ARG u32 millis) {
+     QueuedMessage to_send;
++#if ULTRAMODERN_HOLD_BLOCKED_MESSAGES
++    if (QueuedMessage::send_blocked_messages(PASS_RDRAM1)) {
++        return;
++    }
++#endif
+     snap_run_clock_pause();
+     const bool got = external_messages.wait_dequeue_timed(to_send, std::chrono::milliseconds{millis});
+     snap_run_clock_resume();
+     if (got) {
+         if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
+-            external_messages.enqueue(to_send);
++            REQUEUE_BLOCKED_MESSAGE(to_send);
++        }
++    }
++}
++
++#if ULTRAMODERN_HOLD_BLOCKED_MESSAGES
++// An external message whose queue is full and that is to be sent again waits here, and is tried again before any other
++// at a game thread's next OS call or the idle thread's next wait. Put back into external_messages, the idle thread
++// (pause_self) took it again at once, since that queue keeps no order between producers: it spun on it, ~12 million
++// times a second, and the messages behind it waited until a game thread's OS call drained the queue, often the
++// scheduler's at the next retrace. Jet Force Gemini leaves a controller (SI) message blocked for good, so with the RSP's
++// completion of a display list sent before the RDP's, each frame's RDP completion waited for a retrace: 4-6 retraces a
++// game frame instead of 2. A slot frees only by a game thread's receive, which an OS call or an idle wait follows, so a
++// message held here is never stranded. Only the game thread that runs touches the list.
++std::vector<QueuedMessage> QueuedMessage::blocked_messages{};
++
++bool QueuedMessage::send_blocked_messages(RDRAM_ARG1) {
++    bool sent_any = false;
++    for (size_t i = 0; i < blocked_messages.size();) {
++        const QueuedMessage& cur_mesg = blocked_messages[i];
++        if (do_send(PASS_RDRAM cur_mesg.mq, cur_mesg.mesg, cur_mesg.jam, false)) {
++            blocked_messages.erase(blocked_messages.begin() + i);
++            sent_any = true;
++        } else {
++            i++;
+         }
+     }
++    return sent_any;
+ }
++#endif
+ 
+ extern "C" void osCreateMesgQueue(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg, s32 count) {
+     OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
+diff --git b/ultramodern/src/threads.cpp a/ultramodern/src/threads.cpp
+index b2e375c..8fbc05f 100644
+--- b/ultramodern/src/threads.cpp
++++ a/ultramodern/src/threads.cpp
+@@ -280,6 +280,15 @@ void ultramodern::set_native_thread_priority(ThreadPriority pri) {
+         fprintf(stderr, "[Thread] macOS refused the time-constraint policy for a pacing thread (%d); the game's pace may drift\n", int(result));
+     }
+ }
++#elif defined(__EMSCRIPTEN__)
++#include <emscripten/threading.h>
++
++void ultramodern::set_native_thread_name(const std::string& name) {
++    emscripten_set_thread_name(pthread_self(), name.c_str());
++}
++
++// Web workers have no priorities.
++void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
+ #endif
+ 
+ // Pokemon Snap port: how long THIS thread spent handed off to another guest
+@@ -607,7 +616,26 @@ extern "C" void osStartThread(RDRAM_ARG PTR(OSThread) t_) {
+ 
+     // If this is a game thread, insert the new thread into the running queue and then check the running queue.
+     if (thread_self) {
++#if ULTRAMODERN_LIBULTRA_THREAD_STOP
++        // Only a stopped thread can be started (libultra ignores the call otherwise).
++        if (t->state != OSThreadState::STOPPED) {
++            return;
++        }
++        // A thread stopped by another thread while it was blocked on a message queue goes back on that queue,
++        // and the queue's first waiter is made runnable so that it rechecks the queue, like libultra does.
++        // Messages that arrived while the thread was stopped are picked up that way.
++        if (t->queue != NULLPTR && t->queue != ultramodern::running_queue) {
++            PTR(PTR(OSThread)) waiting_queue = t->queue;
++            ultramodern::thread_queue_insert(PASS_RDRAM waiting_queue, t_);
++            t->state = OSThreadState::BLOCKED;
++            ultramodern::schedule_running_thread(PASS_RDRAM ultramodern::thread_queue_pop(PASS_RDRAM waiting_queue));
++        }
++        else {
++            ultramodern::schedule_running_thread(PASS_RDRAM t_);
++        }
++#else
+         ultramodern::schedule_running_thread(PASS_RDRAM t_);
++#endif
+         ultramodern::check_running_queue(PASS_RDRAM1);
+     }
+     // Otherwise, immediately start the thread and terminate this one.
+@@ -707,11 +735,35 @@ extern "C" void osStopThread(RDRAM_ARG PTR(OSThread) t_) {
+     }
+     // Check if the thread is stopping itself (arg is null or thread_self).
+     if (t_ == thread_self) {
++#if ULTRAMODERN_LIBULTRA_THREAD_STOP
++        // Stopped, so that osStartThread starts it again: a running thread's state is still QUEUED from when it was
++        // scheduled, and osStartThread ignores a thread that isn't stopped.
++        TO_PTR(OSThread, t_)->state = OSThreadState::STOPPED;
++#endif
+         ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
+     }
++#if ULTRAMODERN_LIBULTRA_THREAD_STOP
++    // Stopping another thread: it is either waiting in the running queue or blocked on a message queue (only one
++    // game thread runs at a time). Take it off that queue so nothing schedules it until osStartThread, but keep
++    // t->queue so that osStartThread can put a blocked thread back where it was waiting.
++    else {
++        OSThread* t = TO_PTR(OSThread, t_);
++        if (t->state == OSThreadState::STOPPED) {
++            return;
++        }
++        if (t->queue != NULLPTR) {
++            ultramodern::thread_queue_remove(PASS_RDRAM t->queue, t_);
++        }
++        if (t->queue == ultramodern::running_queue) {
++            t->queue = NULLPTR;
++        }
++        t->state = OSThreadState::STOPPED;
++    }
++#else
+     else {
+         assert(false);
+     }
++#endif
+ }
+ 
+ extern "C" void osDestroyThread(RDRAM_ARG PTR(OSThread) t_) {
+diff --git b/ultramodern/src/timer.cpp a/ultramodern/src/timer.cpp
+index 68a63d0..10d5c21 100644
+--- b/ultramodern/src/timer.cpp
++++ a/ultramodern/src/timer.cpp
+@@ -37,6 +37,38 @@ static uint32_t speed_den = 1;
+ static uint64_t clock_base_ticks = 0;                                               // the counter at the last change
+ static std::chrono::high_resolution_clock::time_point clock_base_time = start_time; // the instant of the last change
+ 
++#if defined(__EMSCRIPTEN__)
++// The timer thread's queue, whose wait_dequeue_timed ends at its time. On a page a timed wait can end long after its
++// time: in Firefox on Windows every one ends on the system timer's tick, 15.6 ms unless the browser's process asks for
++// a finer one, so a timer a fraction of a millisecond away fired a tick late, and the game thread waiting for it waited
++// that long (Conker's timers are 0.4 ms or less, about 60 a second). So a timer less than 2 ms away is waited for by
++// polling the queue, and a farther one on a timer as before: polling the last stretch before those too, up to a tick,
++// kept the browser ~0.6 cores busier in Firefox with Banjo's page and presented no more.
++template<typename T>
++struct TimerQueue : moodycamel::BlockingConcurrentQueue<T> {
++    TimerQueue() : moodycamel::BlockingConcurrentQueue<T>() {}
++
++    template<typename Rep, typename Period>
++    bool wait_dequeue_timed(T& item, const std::chrono::duration<Rep, Period>& timeout) {
++        if (timeout >= std::chrono::milliseconds(2)) {
++            return moodycamel::BlockingConcurrentQueue<T>::wait_dequeue_timed(item, timeout);
++        }
++
++        const auto deadline = std::chrono::high_resolution_clock::now() + timeout;
++        while (std::chrono::high_resolution_clock::now() < deadline) {
++            if (this->try_dequeue(item)) {
++                return true;
++            }
++        }
++
++        return false;
++    }
++};
++#else
++template<typename T>
++using TimerQueue = moodycamel::BlockingConcurrentQueue<T>;
++#endif
++
+ struct OSTimer {
+     PTR(OSTimer) unused1;
+     PTR(OSTimer) unused2;
+@@ -58,7 +90,7 @@ using Action = std::variant<AddTimerAction, RemoveTimerAction>;
+ 
+ struct TimerContext {
+     std::thread thread;
+-    moodycamel::BlockingConcurrentQueue<Action> action_queue{};
++    TimerQueue<Action> action_queue{};
+ };
+ // Pokemon Snap port: never destroyed (see clock_mutex above).
+ static TimerContext& timer_context = *new TimerContext();

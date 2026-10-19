@@ -1,0 +1,26 @@
+# The files tools/build_web.sh leaves out of N64Recomp-browser's web patches, whose web change is in
+# patches/web/<project>.patch: <project> <file> <hash of the web's change it was merged from>
+# (tools/check_web_patches.sh).
+# merged from N64Recomp-browser b550d6e4d41d20689bac42728b71981e7083b8b3
+rt64 CMakeLists.txt 331b5c7b57ceb4c06008e82d766b918c7b69a288
+rt64 src/hle/rt64_game_frame.cpp ffa5b30b5e01540bf048549284976d638e259f39
+rt64 src/hle/rt64_game_frame.h 56032f4f4b8753f58fcab8910e6bf94fe762ba1a
+rt64 src/hle/rt64_present_queue.cpp b919e95c63a4f5704a082c12c916a51e46cfdac9
+rt64 src/hle/rt64_present_queue.h 3b298c2c61adead7d75bc9c8253eed234b4b4f59
+rt64 src/hle/rt64_state.cpp 844722ef1a78cfff750a0415f0412fcd5d9805d2
+rt64 src/hle/rt64_state.h 0832fe111a03322311e40d8ba0c7b2dfde8fd533
+rt64 src/hle/rt64_vi.cpp a3f13bb47cd3d65f98d84e616ed7a3f769182302
+rt64 src/hle/rt64_workload_queue.cpp 521c1a1eef712d6bdbb7cd53c679d1147e424a4c
+rt64 src/render/rt64_raster_shader.cpp 4975b0385cc61e250023e9052ca7d7422c5a645b
+rt64 src/render/rt64_raster_shader.h b49c79cc9a456ae694b82312efd937eb7525200e
+rt64 src/render/rt64_raster_shader_cache.cpp c4a3b7c353450467dc01d7af8ba172c4fb70e1be
+rt64 src/render/rt64_raster_shader_cache.h 64ff47aa366449c1ec53b04e8f6ea1ccbb2a564c
+rt64 src/shaders/RasterPS.hlsl 2c2f5eebb82c4111c7ce61c11ec1e3557990dadc
+rt64 src/shaders/TextureDecodeCS.hlsl 0d6ee12284883acc369732db06f27e3ba11ac17c
+rt64 src/shared/rt64_rdp_params.h 6e2f0807f975c8efe8c168ea6c7009e22ee9d481
+N64ModernRuntime librecomp/src/mods.cpp 242b509ad08710ea83e853def98f628fe57673c5
+N64ModernRuntime ultramodern/CMakeLists.txt 21ac2cc4a2a0a140625d5ebb15e1511d6ccb233c
+N64ModernRuntime ultramodern/src/events.cpp fbf578b51918e2372476cb499c053ad749f63fb8
+N64ModernRuntime ultramodern/src/mesgqueue.cpp 1b61b59289783dc1be05151aff12060e4de5c517
+N64ModernRuntime ultramodern/src/threads.cpp b8357adaa39b68ffa747c543af4530f1fcace407
+N64ModernRuntime ultramodern/src/timer.cpp bb823771803eec9fbadf762064add9acbbd332eb

@@ -11,7 +11,7 @@ finishes the patch table in RecompiledPatches for mods' hooks
 (finish_patch_table). Re-run this after regenerating RecompiledFuncs or
 RecompiledPatches with N64Recomp; it is idempotent.
 
-Usage: python tools/hook_funcs.py [RecompiledFuncs directory]
+Usage: python tools/hook_funcs.py [--web] [RecompiledFuncs directory]
 """
 import pathlib
 import re
@@ -172,6 +172,30 @@ HOOKED = [
 # Anchored to an address rather than to surrounding text, so a regeneration that
 # moves the code still finds it -- and if the address stops being a label at all,
 # this fails loudly instead of silently doing nothing.
+# With --web (tools/build_web.sh), for the page's web/survey.cpp: the main menu's and the new game's scenes, through
+# which a script starts any course, and every other scene's, which note the scene for it. A desktop build hooks
+# none of them.
+WEB_HOOKED = [
+    'func_800E4830_A0BDC0',
+    'menu_new_game_entry',
+    # Every other scene's function, noting the scene for a script (Module._snap_web_scene).
+    'func_beach_802C4740',
+    'tunnel_Start',
+    'func_802BE3B0_640860',
+    'func_802D9210_6C0FF0',
+    'volcano_Start',
+    'func_802C6544_79FAD4',
+    'func_80346EF0_826660',
+    'func_camera_check_801DCACC',
+    'func_oaks_lab_800E1AD8',
+    'album_Start',
+    'func_801DCC74_9D35E4',
+    'func_801DCC74_98C6E4',
+    'func_801DCEBC_9FAB7C',
+    'func_801DD09C_A08C8C',
+    'func_credits_801DCB24',
+]
+
 INNER_HOOKS = [
     # 0x800A5158 is the one point every drawn particle passes through exactly
     # once, BEFORE any display-list cursor fetch that could bypass a tag.
@@ -523,7 +547,10 @@ def finish_patch_table(port_root: pathlib.Path) -> str:
 
 def main() -> int:
     # Default: the port root's RecompiledFuncs, wherever this is run from.
-    root = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(__file__).resolve().parent.parent / 'RecompiledFuncs'
+    args = [a for a in sys.argv[1:] if a != '--web']
+    if '--web' in sys.argv[1:]:
+        HOOKED.extend(WEB_HOOKED)
+    root = pathlib.Path(args[0]) if args else pathlib.Path(__file__).resolve().parent.parent / 'RecompiledFuncs'
     if not root.is_dir():
         print(f'not a directory: {root}')
         return 1

@@ -21,6 +21,73 @@
 
 #include "hle/rt64_snap_diag.h"
 
+#if defined(__EMSCRIPTEN__)
+// On a page the sound plays on the browser's audio thread (N64Recomp-browser's n64recomp_browser::audio, an AudioWorklet
+// reading a ring in the program's memory): Emscripten's SDL2 plays its queue from the page's own thread, where WebGPU's
+// work runs, and its sound breaks up whenever that thread is busy. The ring runs at the page's audio context's rate, so
+// an SDL audio stream converts the game's to it. The SDL calls below stand for those, so the code that uses them is the
+// desktop build's: the device is the stream, its queue the stream's leftovers and the ring together.
+#include "audio_output.h"
+
+namespace {
+SDL_AudioStream* web_stream = nullptr;
+uint32_t web_rate = 0;
+int web_frequency = 0;
+std::vector<float> web_frames;
+
+SDL_AudioDeviceID web_open(const SDL_AudioSpec* desired, SDL_AudioSpec* obtained) {
+    if (web_rate == 0) {
+        web_rate = n64recomp_browser::audio::open(2);
+    }
+    web_stream = SDL_NewAudioStream(AUDIO_S16SYS, 2, desired->freq, AUDIO_F32SYS, 2, static_cast<int>(web_rate));
+    if (web_stream == nullptr) {
+        return 0;
+    }
+    web_frequency = desired->freq;
+    *obtained = *desired;
+    return 1;
+}
+
+void web_close() {
+    SDL_FreeAudioStream(web_stream);
+    web_stream = nullptr;
+}
+
+int web_queue(const void* data, uint32_t bytes) {
+    if (SDL_AudioStreamPut(web_stream, data, static_cast<int>(bytes)) != 0) {
+        return -1;
+    }
+    const int available = SDL_AudioStreamAvailable(web_stream);
+    if (available > 0) {
+        web_frames.resize(static_cast<size_t>(available) / sizeof(float));
+        const int got = SDL_AudioStreamGet(web_stream, web_frames.data(), available);
+        if (got > 0) {
+            n64recomp_browser::audio::queue(web_frames.data(), static_cast<size_t>(got) / (2 * sizeof(float)));
+        }
+    }
+    return 0;
+}
+
+// In bytes of the game's frames, as SDL_GetQueuedAudioSize counts them: 16-bit stereo at the game's rate.
+uint32_t web_queued_bytes() {
+    const uint64_t pending = static_cast<uint64_t>(SDL_AudioStreamAvailable(web_stream)) / (2 * sizeof(float)) +
+                             n64recomp_browser::audio::queued_frames();
+    return static_cast<uint32_t>(pending * static_cast<uint64_t>(web_frequency) / web_rate * 2 * sizeof(int16_t));
+}
+
+void web_clear() {
+    SDL_AudioStreamClear(web_stream);
+}
+}
+
+#define SDL_OpenAudioDevice(device, iscapture, desired, obtained, allowed_changes) web_open(desired, obtained)
+#define SDL_CloseAudioDevice(device) web_close()
+#define SDL_PauseAudioDevice(device, pause_on) ((void)0)
+#define SDL_QueueAudio(device, data, len) web_queue(data, len)
+#define SDL_GetQueuedAudioSize(device) web_queued_bytes()
+#define SDL_ClearQueuedAudio(device) web_clear()
+#endif
+
 namespace snap {
 
 // ---------------------------------------------------------------------------

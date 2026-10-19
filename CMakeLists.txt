@@ -65,6 +65,12 @@ else()
                         "-ffile-prefix-map=${CMAKE_CURRENT_BINARY_DIR}/=")
 endif()
 
+# The page for a browser (tools/build_web.sh) is web/page.cmake's.
+if (EMSCRIPTEN)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/web/page.cmake)
+    return()
+endif()
+
 # =============================================================================
 # Options
 # =============================================================================

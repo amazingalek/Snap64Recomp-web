@@ -1,0 +1,24 @@
+{
+ "page": "Snap64Recomp.html",
+ "header": [
+  "Pokémon Snap (US), recorded by web/record_shaders.sh from web/shader_plan.json in headless Chrome: the launcher and",
+  "the boot to the main menu (section 0), the main menu, then a section a course, each started from the main menu by",
+  "web/survey.cpp and ridden to its end by web/shader_survey.js (the camera out, photos taken, the items thrown), and",
+  "the screens after a course (the camera check, Oak's report), reached through a ride of the beach left out."
+ ],
+ "load": [["wait", 5000]],
+ "setup": [["rom", 628, 322], ["wait", 3000]],
+ "start": [["click", 628, 322], ["evalFile", "shader_survey.js"], ["eval", "sceneReached(8, 120000)"], ["wait", 3000]],
+ "sections": [
+  {"name": "menus", "steps": [["wait", 30000]]},
+  {"name": "beach", "steps": [["eval", "course(0, 60000)"], ["eval", "ride(420)"], ["wait", 3000]]},
+  {"name": "tunnel", "steps": [["eval", "course(1, 60000)"], ["eval", "ride(420)"], ["wait", 3000]]},
+  {"name": "volcano", "steps": [["eval", "course(2, 60000)"], ["eval", "ride(420)"], ["wait", 3000]]},
+  {"name": "river", "steps": [["eval", "course(3, 60000)"], ["eval", "ride(420)"], ["wait", 3000]]},
+  {"name": "cave", "steps": [["eval", "course(4, 60000)"], ["eval", "ride(420)"], ["wait", 3000]]},
+  {"name": "valley", "steps": [["eval", "course(5, 60000)"], ["eval", "ride(420)"], ["wait", 3000]]},
+  {"name": "rainbow", "steps": [["eval", "course(6, 60000)"], ["eval", "ride(420)"], ["wait", 3000]]},
+  {"name": "report", "steps": [["keep", false], ["eval", "course(0, 60000)"], ["eval", "ride(420)"], ["keep", true],
+   ["eval", "browse(150).then((s) => console.log('[plan] screens ' + s.join(' ')))"]]}
+ ]
+}

@@ -196,6 +196,10 @@ public:
 #elif defined(__APPLE__)
         core.window.window = window_handle.window;
         core.window.view   = window_handle.view;
+#elif defined(__EMSCRIPTEN__)
+        // On a page RT64 draws on the canvas, which SDL's window is.
+        (void)window_handle;
+        core.window = "#canvas";
 #else
         // Linux / Android: WindowHandle IS SDL_Window*
         core.window = window_handle;
@@ -249,6 +253,9 @@ public:
 #elif defined(__APPLE__)
         app_->userConfig.graphicsAPI = RT64::UserConfiguration::GraphicsAPI::Metal;
         printf("[SNAP] graphics API: Metal\n");
+#elif defined(__EMSCRIPTEN__)
+        // A page's RT64 draws with WebGPU whatever is asked for.
+        printf("[SNAP] graphics API: WebGPU\n");
 #else
         app_->userConfig.graphicsAPI = RT64::UserConfiguration::GraphicsAPI::Vulkan;
         printf("[SNAP] graphics API: Vulkan\n");

@@ -559,6 +559,13 @@ void open_folder(const std::string& utf8) {
 }
 #endif
 
+#if defined(__EMSCRIPTEN__)
+// A page has no file manager to open: the sheet stays in the page's storage.
+void open_folder(const std::string& utf8) {
+    say("the printed sheet is in %s", utf8.c_str());
+}
+#endif
+
 #if defined(_WIN32)
 // The kiosk handed the player the sheet; the port opens its folder as the
 // normal boot after a print gets under way.

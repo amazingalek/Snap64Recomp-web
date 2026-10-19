@@ -50,6 +50,19 @@ const std::filesystem::path& base_dir() {
             return result;
         }
 #endif
+#if defined(__EMSCRIPTEN__)
+        // On a page the program's folder is the root of its in-memory file
+        // system, which holds the shipped files (web/page.cmake) and forgets
+        // what is written there. HOME is what the page keeps in the browser's
+        // storage (N64Recomp-browser's persistent_home.js): the ROM the
+        // player loaded, the save, the settings and the shader cache.
+        if (const char* h = std::getenv("HOME"); h && *h) {
+            result = std::filesystem::path(h) / ".config" / "Snap64Recomp";
+            std::error_code ec;
+            std::filesystem::create_directories(result, ec);
+            return result / "";
+        }
+#endif
 #if defined(__linux__)
         // Otherwise the executable's own folder when it can be written,
         // which is the unpacked tarball; when it cannot (a read-only mount,

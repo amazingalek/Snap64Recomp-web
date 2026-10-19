@@ -63,3 +63,7 @@ data_dump.toml
 
 # The author's working notes for the coding assistant: local to the machine, never part of a release.
 CLAUDE.md
+
+# The web build (tools/build_web.sh)
+build-web/
+build-web-prep/

@@ -1,0 +1,21 @@
+{
+ "page": "Snap64Recomp.html",
+ "header": [
+  "Pokémon Snap's play plan for N64Recomp-browser's tools/play_page.mjs: the launcher, the boot to the main menu, then",
+  "the beach started from the main menu by web/survey.cpp and ridden to its end by web/shader_survey.js (the camera",
+  "out, photos taken, the items thrown), and the screens after it (the camera check, Oak's report) pressed through."
+ ],
+ "load": [["wait", 5000]],
+ "setup": [["rom", 628, 322], ["wait", 3000]],
+ "start": [["click", 628, 322], ["evalFile", "shader_survey.js"], ["need", "sceneReached(8, 120000)"]],
+ "play": [
+  ["wait", 8000],
+  ["shot", "menu.png"],
+  ["need", "course(0, 60000)"],
+  ["wait", 20000],
+  ["shot", "beach.png"],
+  ["eval", "ride(400).then((ended) => console.log('[plan] the beach ' + (ended ? 'ended' : 'still going')))"],
+  ["eval", "browse(60).then((s) => console.log('[plan] screens ' + s.join(' ')))"],
+  ["shot", "report.png"]
+ ]
+}

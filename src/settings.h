@@ -41,7 +41,14 @@ struct Settings {
     // runs on the frames the game draws, not on the synthetic presents
     // between them. The focus indicator under interpolation has not been
     // re-measured since the port's focus-dot work; treat it as unverified.
+#if defined(__EMSCRIPTEN__)
+    // On a page, Display: every web build of an N64 recomp interpolates to
+    // the display's rate, as the others' pages do (the photo scoring above
+    // holds under it). A player can still pick Original in the menu.
+    int   fps_mode          = 1;
+#else
     int   fps_mode          = 0;
+#endif
     int   fps_manual_target = 120;
     // Which of RT64's backends draws: 0 Direct3D 12, the default on
     // Windows; 1 Vulkan, the Linux build's only backend, run on Windows

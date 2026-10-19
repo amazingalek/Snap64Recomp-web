@@ -46,7 +46,9 @@
 #include "version.h"
 
 #include <SDL.h>
+#if !defined(__EMSCRIPTEN__)
 #include <nfd.h>
+#endif
 
 namespace snap {
 
@@ -593,6 +595,10 @@ bool mods_pick_and_install() {
             from = semi + 1;
         }
     } else {
+#if defined(__EMSCRIPTEN__)
+        // A page takes no mods (no live recompiler), so it has nothing to pick.
+        return false;
+#else
         if (NFD_Init() != NFD_OKAY) {
             const char* err = NFD_GetError();
             printf("[SNAP-MODS] the file picker could not start: %s\n", err ? err : "no reason given");
@@ -618,6 +624,7 @@ bool mods_pick_and_install() {
             printf("[SNAP-MODS] the file picker failed: %s\n", err ? err : "no reason given");
         }
         NFD_Quit();
+#endif
     }
     printf("[SNAP-MODS] the Mods page's Install row: %zu file%s chosen\n", files.size(), (files.size() == 1) ? "" : "s");
     fflush(stdout);

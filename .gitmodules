@@ -12,3 +12,6 @@
 [submodule "lib/DirectX-Headers"]
 	path = lib/DirectX-Headers
 	url = https://github.com/microsoft/DirectX-Headers.git
+[submodule "lib/N64Recomp-browser"]
+	path = lib/N64Recomp-browser
+	url = https://github.com/amazingalek/N64Recomp-browser

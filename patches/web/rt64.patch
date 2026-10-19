@@ -1,0 +1,3301 @@
+diff --git b/CMakeLists.txt a/CMakeLists.txt
+index 842fb31..5be7312 100644
+--- b/CMakeLists.txt
++++ a/CMakeLists.txt
+@@ -11,7 +11,13 @@ endif()
+ option(RT64_STATIC "Build RT64 as a static library" OFF)
+ 
+ 
++option(RT64_WGSL "Compile the shaders to WGSL for WebGPU, in place of DXIL, SPIR-V and Metal (always on with Emscripten)" OFF)
+ option(RT64_SDL_WINDOW_VULKAN "Build RT64 to expect an SDL Window outside of Windows" OFF)
++option(RT64_PER_DRAW_TEXTURES "Bind textures per draw on every device, as devices without descriptor indexing (WebGPU) need; to test that path" OFF)
++option(RT64_PACKED_RSP_INPUTS "Gather the RSP compute shaders' inputs into one buffer on every device, as WebGPU's 8 storage buffers per stage need; to test that path" OFF)
++option(RT64_FLIPPED_RECT_HIGH_RES "Sample a high-res replacement on a rect drawn backwards on the texel the RDP picks, not one native pixel behind it (always on with Emscripten)" OFF)
++option(RT64_UNEVEN_FRAME_RATES "Interpolate a game whose last frames took an uneven number of VIs (the slowest at most twice the fastest) at the rate of the fastest, not leave it uninterpolated (always on with Emscripten)" OFF)
++option(RT64_OFFSCREEN_WORKLOADS "A workload that draws only to framebuffers the VI has not shown is a pass of the next one's game frame, so a game that draws such a pass in a display list of its own interpolates (always on with Emscripten)" OFF)
+ 
+ if (NOT ${RT64_STATIC})
+     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+@@ -65,13 +71,37 @@ else()
+     endif()
+ endif()
+ 
++# WebGPU: dxc (on the host) compiles to SPIR-V with -D WEBGPU, naga turns that into WGSL, and plume's PlumeWGSL.cmake
++# moves the push constants into the uniform buffer plume's WebGPU backend gives them. WEBGPU is what the shaders check
++# (shaders/WebGPU.hlsli).
++if (EMSCRIPTEN)
++    set (RT64_WGSL ON)
++    if (CMAKE_HOST_WIN32)
++        set (DXC "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxc.exe")
++    elseif (CMAKE_HOST_APPLE)
++        set (DXC "DYLD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/arm64" "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/arm64/dxc-macos")
++    else()
++        set (DXC "LD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/x64" "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxc-linux")
++    endif()
++endif()
++if (RT64_WGSL)
++    find_program(RT64_NAGA_EXECUTABLE naga)
++    if (NOT RT64_NAGA_EXECUTABLE)
++        message(FATAL_ERROR "naga not found: install naga-cli (cargo install naga-cli) or set RT64_NAGA_EXECUTABLE.")
++    endif()
++    set (RT64_PLUME_WGSL "${PROJECT_SOURCE_DIR}/src/contrib/plume/examples/cmake/modules/PlumeWGSL.cmake")
++endif()
++
+ set(ZSTD_LEGACY_SUPPORT OFF)
+ set(ZSTD_BUILD_STATIC ON)
+ set(ZSTD_BUILD_SHARED OFF)
+ 
+ add_subdirectory(src/tools/file_to_c)
+ add_subdirectory(src/contrib/re-spirv)
+-add_subdirectory(src/contrib/nativefiledialog-extended)
++# A browser has no native file dialogs.
++if (NOT EMSCRIPTEN)
++    add_subdirectory(src/contrib/nativefiledialog-extended)
++endif()
+ add_subdirectory(src/contrib/zstd/build/cmake)
+ 
+ if (CMAKE_SYSTEM_NAME MATCHES "Linux" AND RT64_SDL_WINDOW_VULKAN)
+@@ -104,6 +134,21 @@ set(ANDROID_ABI arm64-v8a)
+ 
+ # For DXC
+ set (DXC_COMMON_OPTS "-I${PROJECT_SOURCE_DIR}/src")
++# WebGPU has no descriptor indexing, so its shaders always bind textures per draw (TextureSampler.hlsli).
++if (RT64_PER_DRAW_TEXTURES OR RT64_WGSL)
++    list(APPEND DXC_COMMON_OPTS "-D" "PER_DRAW_TEXTURES")
++endif()
++# WebGPU guarantees 8 storage buffers per shader stage, so the RSP compute shaders read their inputs from one
++# (RSPPackedInputs, rt64_rsp_processor.h).
++if (RT64_PACKED_RSP_INPUTS OR RT64_WGSL)
++    set (RT64_PACKED_RSP_INPUTS ON)
++    list(APPEND DXC_COMMON_OPTS "-D" "PACKED_RSP_INPUTS")
++endif()
++# A high-res replacement on a rect drawn backwards (a negative dsdx or dtdy) sampled on the texel the RDP picks
++# (RasterPS.hlsl): a fix for any game with a texture pack, behind an option since it changes what upstream draws.
++if (RT64_FLIPPED_RECT_HIGH_RES OR RT64_WGSL)
++    list(APPEND DXC_COMMON_OPTS "-D" "FLIPPED_RECT_HIGH_RES")
++endif()
+ set (DXC_DXIL_OPTS "-Wno-ignored-attributes")
+ set (DXC_SPV_OPTS "-spirv" "-fspv-target-env=vulkan1.0" "-fvk-use-dx-layout")
+ set (DXC_LB_OPTS "${DXC_COMMON_OPTS}" "-D" "LIBRARY" "-T" "lib_6_3")
+@@ -113,10 +158,25 @@ set (DXC_CS_OPTS "${DXC_COMMON_OPTS}" "-E" "CSMain" "-T cs_6_3")
+ set (DXC_GS_OPTS "${DXC_COMMON_OPTS}" "-E" "GSMain" "-T gs_6_3")
+ set (DXC_RT_OPTS "${DXC_COMMON_OPTS}" "-D" "RT_SHADER" "-T" "lib_6_3" "-fspv-target-env=vulkan1.1spirv1.4" "-fspv-extension=SPV_KHR_ray_tracing" "-fspv-extension=SPV_EXT_descriptor_indexing")
+ 
++# A shader's .hlsli and shared headers are in the depfile dxc writes with -MF, so a change to one rebuilds every shader
++# that includes it. -MF only preprocesses, so the compile is a second command. Other generators (Visual Studio, Xcode)
++# rebuild a shader only when its own file changes.
++function(add_dxc_command OUTPUT FILENAME)
++    if (CMAKE_GENERATOR MATCHES "Ninja|Makefiles")
++        add_custom_command(OUTPUT ${OUTPUT}
++            COMMAND ${DXC} ${ARGN} ${FILENAME} /Fo ${OUTPUT} -MF ${OUTPUT}.d
++            COMMAND ${DXC} ${ARGN} ${FILENAME} /Fo ${OUTPUT}
++            DEPENDS ${FILENAME}
++            DEPFILE ${OUTPUT}.d)
++    else()
++        add_custom_command(OUTPUT ${OUTPUT}
++            COMMAND ${DXC} ${ARGN} ${FILENAME} /Fo ${OUTPUT}
++            DEPENDS ${FILENAME})
++    endif()
++endfunction()
++
+ function(build_shader_spirv_impl TARGETOBJ FILENAME TARGET_NAME OUTNAME)
+-    add_custom_command(OUTPUT ${OUTNAME}.spv
+-        COMMAND ${DXC} ${DXC_SPV_OPTS} ${ARGN} ${FILENAME} /Fo ${OUTNAME}.spv
+-        DEPENDS ${FILENAME})
++    add_dxc_command(${OUTNAME}.spv ${FILENAME} ${DXC_SPV_OPTS} ${ARGN})
+     add_custom_command(OUTPUT ${OUTNAME}.spirv.c
+         COMMAND file_to_c ${OUTNAME}.spv ${TARGET_NAME}BlobSPIRV ${OUTNAME}.spirv.c ${OUTNAME}.spirv.h
+         DEPENDS ${OUTNAME}.spv file_to_c
+@@ -124,10 +184,20 @@ function(build_shader_spirv_impl TARGETOBJ FILENAME TARGET_NAME OUTNAME)
+     target_sources(${TARGETOBJ} PRIVATE ${OUTNAME}.spirv.c)
+ endfunction()
+ 
++function(build_shader_wgsl_impl TARGETOBJ FILENAME TARGET_NAME OUTNAME)
++    # WebGPU's clip space is D3D's, so the vertex shaders keep their y.
++    set(OPTIONS ${ARGN})
++    list(REMOVE_ITEM OPTIONS "-fvk-invert-y")
++    add_dxc_command(${OUTNAME}.wgsl.spv ${FILENAME} ${DXC_SPV_OPTS} -D WEBGPU ${OPTIONS})
++    add_custom_command(OUTPUT ${OUTNAME}.wgsl ${OUTNAME}.wgsl.c ${OUTNAME}.wgsl.h
++        COMMAND ${CMAKE_COMMAND} -DNAGA=${RT64_NAGA_EXECUTABLE} -DINPUT=${OUTNAME}.wgsl.spv -DOUTPUT=${OUTNAME}.wgsl
++            -DVAR_NAME=${TARGET_NAME}BlobWGSL -DOUTPUT_C=${OUTNAME}.wgsl.c -DOUTPUT_H=${OUTNAME}.wgsl.h -P ${RT64_PLUME_WGSL}
++        DEPENDS ${OUTNAME}.wgsl.spv ${RT64_PLUME_WGSL})
++    target_sources(${TARGETOBJ} PRIVATE ${OUTNAME}.wgsl.c)
++endfunction()
++
+ function(build_shader_dxil_impl TARGETOBJ FILENAME TARGET_NAME OUTNAME)
+-    add_custom_command(OUTPUT ${OUTNAME}.dxil
+-        COMMAND ${DXC} ${DXC_DXIL_OPTS} ${ARGN} ${FILENAME} /Fo ${OUTNAME}.dxil
+-        DEPENDS ${FILENAME})
++    add_dxc_command(${OUTNAME}.dxil ${FILENAME} ${DXC_DXIL_OPTS} ${ARGN})
+     add_custom_command(OUTPUT ${OUTNAME}.dxil.c
+         COMMAND file_to_c ${OUTNAME}.dxil ${TARGET_NAME}BlobDXIL ${OUTNAME}.dxil.c ${OUTNAME}.dxil.h
+         DEPENDS ${OUTNAME}.dxil file_to_c
+@@ -136,9 +206,7 @@ function(build_shader_dxil_impl TARGETOBJ FILENAME TARGET_NAME OUTNAME)
+ endfunction()
+ 
+ function(build_shader_msl_impl TARGETOBJ FILENAME TARGET_NAME OUTNAME)
+-    add_custom_command(OUTPUT ${OUTNAME}.spv
+-            COMMAND ${DXC} ${DXC_SPV_OPTS} ${ARGN} ${FILENAME} /Fo ${OUTNAME}.spv
+-            DEPENDS ${FILENAME})
++    add_dxc_command(${OUTNAME}.spv ${FILENAME} ${DXC_SPV_OPTS} ${ARGN})
+     add_custom_command(OUTPUT ${OUTNAME}.metal
+             COMMAND spirv_cross_msl ${OUTNAME}.spv ${OUTNAME}.metal
+             DEPENDS ${OUTNAME}.spv spirv_cross_msl)
+@@ -170,6 +238,10 @@ function(build_shader TARGETOBJ SHADERNAME OPTIONS)
+     cmake_path(GET OUTNAME STEM TARGET_NAME)
+     cmake_path(GET OUTNAME PARENT_PATH OUTPUT_DIR)
+     file(MAKE_DIRECTORY ${OUTPUT_DIR})
++    if (RT64_WGSL)
++        build_shader_wgsl_impl(${TARGETOBJ} ${FILENAME} ${TARGET_NAME} ${OUTNAME} ${OPTIONS} ${EXTRA_ARGS})
++        return()
++    endif()
+     # Compile DXIL shader binaries if building on Windows
+     if (WIN32)
+         build_shader_dxil_impl(${TARGETOBJ} ${FILENAME} ${TARGET_NAME} ${OUTNAME} ${OPTIONS} ${EXTRA_ARGS})
+@@ -215,6 +287,10 @@ function(build_shader_spirv TARGETOBJ SHADERNAME OPTIONS)
+     cmake_path(GET OUTNAME STEM TARGET_NAME)
+     cmake_path(GET OUTNAME PARENT_PATH OUTPUT_DIR)
+     file(MAKE_DIRECTORY ${OUTPUT_DIR})
++    if (RT64_WGSL)
++        build_shader_wgsl_impl(${TARGETOBJ} ${FILENAME} ${TARGET_NAME} ${OUTNAME} ${OPTIONS} ${EXTRA_ARGS})
++        return()
++    endif()
+     build_shader_spirv_impl(${TARGETOBJ} ${FILENAME} ${TARGET_NAME} ${OUTNAME} ${OPTIONS} ${EXTRA_ARGS})
+ endfunction()
+ 
+@@ -289,6 +365,11 @@ if (WIN32)
+     set(SDL2_INCLUDE_DIRS "${PROJECT_SOURCE_DIR}/src/contrib/mupen64plus-win32-deps/SDL2-2.26.3/include")
+     set(SDL2_LIBRARIES "SDL2" "SDL2main")
+     link_directories("${PROJECT_SOURCE_DIR}/src/contrib/mupen64plus-win32-deps/SDL2-2.26.3/lib/x64")
++elseif (EMSCRIPTEN)
++    # Emscripten's own port of SDL2.
++    add_compile_options("-sUSE_SDL=2")
++    set(SDL2_LIBRARIES "-sUSE_SDL=2")
++    set(SDL2_INCLUDE_DIRS "${EMSCRIPTEN_SYSROOT}/include/SDL2")
+ elseif (TARGET SDL2-static)
+     # Snap64 Recomp: on macOS the port builds SDL2 from its own vendored tree
+     # as a static library, and set SDL2_INCLUDE_DIRS and SDL2_LIBRARIES to it
+@@ -444,9 +525,28 @@ endif()
+ set_target_properties(rt64 PROPERTIES OUTPUT_NAME "rt64")
+ set_target_properties(rt64 PROPERTIES PREFIX "")
+ 
++if (RT64_PER_DRAW_TEXTURES)
++    target_compile_definitions(rt64 PUBLIC RT64_PER_DRAW_TEXTURES=1)
++endif()
++
++if (RT64_PACKED_RSP_INPUTS)
++    target_compile_definitions(rt64 PUBLIC RT64_PACKED_RSP_INPUTS=1)
++endif()
++if (RT64_WGSL)
++    target_compile_definitions(rt64 PUBLIC RT64_WGSL=1)
++endif()
++if (RT64_OFFSCREEN_WORKLOADS OR RT64_WGSL)
++    target_compile_definitions(rt64 PUBLIC RT64_OFFSCREEN_WORKLOADS=1)
++endif()
++if (RT64_UNEVEN_FRAME_RATES OR RT64_WGSL)
++    target_compile_definitions(rt64 PRIVATE RT64_UNEVEN_FRAME_RATES=1)
++endif()
++
+ # Add common libraries.
+ target_link_libraries(rt64 re-spirv)
+-target_link_libraries(rt64 nfd)
++if (NOT EMSCRIPTEN)
++    target_link_libraries(rt64 nfd)
++endif()
+ target_link_libraries(rt64 libzstd_static)
+ target_link_libraries(rt64 plume)
+ 
+@@ -509,9 +609,141 @@ build_pixel_shader_spec_constants(rt64 "src/shaders/RasterPS.hlsl" "src/shaders/
+ build_pixel_shader_spec_constants(rt64 "src/shaders/RasterPS.hlsl" "src/shaders/RasterPSSpecConstantMS.hlsl" "-D SPEC_CONSTANT_RENDER_PARAMS" "-D MULTISAMPLING")
+ build_pixel_shader_spec_constants(rt64 "src/shaders/RasterPS.hlsl" "src/shaders/RasterPSSpecConstantFlat.hlsl" "-D SPEC_CONSTANT_RENDER_PARAMS" "-D VERTEX_FLAT_COLOR")
+ build_pixel_shader_spec_constants(rt64 "src/shaders/RasterPS.hlsl" "src/shaders/RasterPSSpecConstantFlatMS.hlsl" "-D SPEC_CONSTANT_RENDER_PARAMS" "-D VERTEX_FLAT_COLOR" "-D MULTISAMPLING")
++if (RT64_WGSL)
++    # Dual-source blending is optional in WebGPU, so RasterPS also comes with it, for the devices that have it; the
++    # variants above write one output (RasterPS.hlsl).
++    build_pixel_shader(  rt64 "src/shaders/RasterPS.hlsl" "src/shaders/RasterPSDynamicDualSource.hlsl" "-D DYNAMIC_RENDER_PARAMS" "-D DUAL_SOURCE_BLENDING")
++    build_pixel_shader(  rt64 "src/shaders/RasterPS.hlsl" "src/shaders/RasterPSDynamicMSDualSource.hlsl" "-D DYNAMIC_RENDER_PARAMS" "-D MULTISAMPLING" "-D DUAL_SOURCE_BLENDING")
++    build_pixel_shader_spec_constants(rt64 "src/shaders/RasterPS.hlsl" "src/shaders/RasterPSSpecConstantDualSource.hlsl" "-D SPEC_CONSTANT_RENDER_PARAMS" "-D DUAL_SOURCE_BLENDING")
++    build_pixel_shader_spec_constants(rt64 "src/shaders/RasterPS.hlsl" "src/shaders/RasterPSSpecConstantMSDualSource.hlsl" "-D SPEC_CONSTANT_RENDER_PARAMS" "-D MULTISAMPLING" "-D DUAL_SOURCE_BLENDING")
++    build_pixel_shader_spec_constants(rt64 "src/shaders/RasterPS.hlsl" "src/shaders/RasterPSSpecConstantFlatDualSource.hlsl" "-D SPEC_CONSTANT_RENDER_PARAMS" "-D VERTEX_FLAT_COLOR" "-D DUAL_SOURCE_BLENDING")
++    build_pixel_shader_spec_constants(rt64 "src/shaders/RasterPS.hlsl" "src/shaders/RasterPSSpecConstantFlatMSDualSource.hlsl" "-D SPEC_CONSTANT_RENDER_PARAMS" "-D VERTEX_"-D SPEC_CONSTANT_RENDER_PARAMS" "-D VERTEX_FLAT_COLOR"_COLOR" "-D MULTISAMPLING" "-D DUAL_SOURCE_BLENDING")
++    # The RasterPS the browser specializes at run time with override values (ShaderCacheWGSL, rt64_raster_shader.h)
++    # keeps the ubershader's loops (SPEC_CONSTANT_LOOPS): nothing strips it of dead code before the browser parses all of
++    # it, and Chrome parses a module on its GPU main thread, where every present waits behind it. The unrolled ones
++    # above are what the prebuilt shaders are specialized from (spirv-opt), which removes what a shader doesn't use.
++    # Unrolled it is 670 KB of WGSL, which Chrome 155 parsed in 683 ms and built pipelines from in 1.0-1.6 s each; with
++    # the loops 250 KB, 149 ms and 0.29-0.46 s (a test page, six of GoldenEye's shaders, RTX 2070).
++    build_pixel_shader_spec_constants(rt64 "src/shaders/RasterPS.hlsl" "src/shaders/RasterPSSpecConstantFlatLoops.hlsl" "-D SPEC_CONSTANT_RENDER_PARAMS" "-D VERTEX_FLAT_COLOR" "-D SPEC_CONSTANT_LOOPS")
++    build_pixel_shader_spec_constants(rt64 "src/shaders/RasterPS.hlsl" "src/shaders/RasterPSSpecConstantFlatLoopsMS.hlsl" "-D SPEC_CONSTANT_RENDER_PARAMS" "-D VERTEX_FLAT_COLOR" "-D SPEC_CONSTANT_LOOPS" "-D MULTISAMPLING")
++    build_pixel_shader_spec_constants(rt64 "src/shaders/RasterPS.hlsl" "src/shaders/RasterPSSpecConstantFlatLoopsDualSource.hlsl" "-D SPEC_CONSTANT_RENDER_PARAMS" "-D VERTEX_FLAT_COLOR" "-D SPEC_CONSTANT_LOOPS" "-D DUAL_SOURCE_BLENDING")
++    build_pixel_shader_spec_constants(rt64 "src/shaders/RasterPS.hlsl" "src/shaders/RasterPSSpecConstantFlatLoopsMSDualSource.hlsl" "-D SPEC_CONSTANT_RENDER_PARAMS" "-D VERTEX_FLAT_COLOR" "-D SPEC_CONSTANT_LOOPS" "-D MULTISAMPLING" "-D DUAL_SOURCE_BLENDING")
++endif()
+ build_vertex_shader( rt64 "src/shaders/RasterVS.hlsl" "src/shaders/RasterVSDynamic.hlsl" "-D DYNAMIC_RENDER_PARAMS")
+ build_vertex_shader_spec_constants( rt64 "src/shaders/RasterVS.hlsl" "src/shaders/RasterVSSpecConstant.hlsl" "-D SPEC_CONSTANT_RENDER_PARAMS")
+ build_vertex_shader_spec_constants( rt64 "src/shaders/RasterVS.hlsl" "src/shaders/RasterVSSpecConstantFlat.hlsl" "-D SPEC_CONSTANT_RENDER_PARAMS" "-D VERTEX_FLAT_COLOR")
++# A Vulkan device without descriptor indexing (an old GPU, lavapipe before Mesa 23) gets the framebuffer renderer's
++# per-draw texture sets at run time (perDrawTextures() in rt64_descriptor_sets.h), so the SPIR-V of every shader that
++# uses those sets is built for them too, as <name>PerDraw, and picked by the same test. A WGSL build has only those.
++if (NOT RT64_WGSL)
++    set(PER_DRAW "-D PER_DRAW_TEXTURES")
++    build_shader_spirv(rt64 "src/shaders/RasterPS.hlsl" "${DXC_PS_OPTS}" "src/shaders/RasterPSDynamicPerDraw.hlsl" "-D DYNAMIC_RENDER_PARAMS" ${PER_DRAW})
++    build_shader_spirv(rt64 "src/shaders/RasterPS.hlsl" "${DXC_PS_OPTS}" "src/shaders/RasterPSDynamicMSPerDraw.hlsl" "-D DYNAMIC_RENDER_PARAMS" "-D MULTISAMPLING" ${PER_DRAW})
++    build_shader_spirv(rt64 "src/shaders/RasterPS.hlsl" "${DXC_PS_OPTS}" "src/shaders/RasterPSSpecConstantPerDraw.hlsl" "-D SPEC_CONSTANT_RENDER_PARAMS" ${PER_DRAW})
++    build_shader_spirv(rt64 "src/shaders/RasterPS.hlsl" "${DXC_PS_OPTS}" "src/shaders/RasterPSSpecConstantMSPerDraw.hlsl" "-D SPEC_CONSTANT_RENDER_PARAMS" "-D MULTISAMPLING" ${PER_DRAW})
++    build_shader_spirv(rt64 "src/shaders/RasterPS.hlsl" "${DXC_PS_OPTS}" "src/shaders/RasterPSSpecConstantFlatPerDraw.hlsl" "-D SPEC_CONSTANT_RENDER_PARAMS" "-D VERTEX_FLAT_COLOR" ${PER_DRAW})
++    build_shader_spirv(rt64 "src/shaders/RasterPS.hlsl" "${DXC_PS_OPTS}" "src/shaders/RasterPSSpecConstantFlatMSPerDraw.hlsl" "-D SPEC_CONSTANT_RENDER_PARAMS" "-D VERTEX_FLAT_COLOR" "-D MULTISAMPLING" ${PER_DRAW})
++    build_shader_spirv(rt64 "src/shaders/RasterVS.hlsl" "${DXC_VS_OPTS}" "src/shaders/RasterVSDynamicPerDraw.hlsl" "-D DYNAMIC_RENDER_PARAMS" ${PER_DRAW})
++    build_shader_spirv(rt64 "src/shaders/RasterVS.hlsl" "${DXC_VS_OPTS}" "src/shaders/RasterVSSpecConstantPerDraw.hlsl" "-D SPEC_CONSTANT_RENDER_PARAMS" ${PER_DRAW})
++    build_shader_spirv(rt64 "src/shaders/RasterVS.hlsl" "${DXC_VS_OPTS}" "src/shaders/RasterVSSpecConstantFlatPerDraw.hlsl" "-D SPEC_CONSTANT_RENDER_PARAMS" "-D VERTEX_FLAT_COLOR" ${PER_DRAW})
++    build_shader_spirv(rt64 "src/shaders/PostBlendDitherNoisePS.hlsl" "${DXC_PS_OPTS}" "src/shaders/PostBlendDitherNoiseAddPSPerDraw.hlsl" "-D ADD_MODE" ${PER_DRAW})
++    build_shader_spirv(rt64 "src/shaders/PostBlendDitherNoisePS.hlsl" "${DXC_PS_OPTS}" "src/shaders/PostBlendDitherNoiseSubPSPerDraw.hlsl" "-D SUB_MODE" ${PER_DRAW})
++    build_shader_spirv(rt64 "src/shaders/PostBlendDitherNoisePS.hlsl" "${DXC_PS_OPTS}" "src/shaders/PostBlendDitherNoiseSubNegativePSPerDraw.hlsl" "-D SUB_MODE" "-D NEGATIVE_MODE" ${PER_DRAW})
++    build_shader_spirv(rt64 "src/shaders/DebugPS.hlsl" "${DXC_PS_OPTS}" "src/shaders/DebugPSPerDraw.hlsl" ${PER_DRAW})
++endif()
++
++# Prebuilt shaders for WebGPU. A game that sets RT64_PREBUILT_SHADER_LIST to a list of the shader descriptions it uses
++# (one per line, five hex words: other mode L and H, color combiner L and H, flags, as its page prints them when opened
++# with ?record-shaders) gets each one specialized here: spirv-opt (SPIRV-Tools) sets the spec constant SPIR-V's
++# constants to the description, freezes them and optimizes what is left, naga turns that into WGSL, and
++# shader_specializer puts the lot into rt64 compressed. RasterShaderCache builds them in every browser
++# (startPrebuild()), with the game waiting: those above the list's first line reading "section <name>" (all of them
++# without one) before it gets past its first frame, and each section after that when the game first draws with its
++# shaders, a level at a time. They are made without MSAA, with RasterPS both with dual-source blending (.ps.wgsl) and
++# without (.ps-single.wgsl).
++# -O runs twice: once leaves much of what the constants decided (a small RasterPS 42 KB of WGSL against 15). Without
++# --strip-debug naga names every value after dxc's debug names. re-spirv, which RT64 specializes with on Vulkan, can't
++# take a loop the shader keeps, which the WebGPU pixel shaders have (TextureSampler.hlsli, RasterPS.hlsl), and on
++# shaders without one spirv-opt alone comes within 1% of re-spirv followed by spirv-opt -O. Against re-spirv alone it
++# makes a RasterPS about 45% smaller and descriptions that differ only in what RasterPS ignores the same, kept once
++# (GoldenEye's 340: 624 different stages to 210, 103 MB of WGSL to 16), and Chrome builds them in about 60% of the time.
++# pack moves the variables naga makes of SPIR-V's phis out of their functions, which Chrome parses about four times
++# faster, on the thread that takes the page's presents (shader_specializer.cpp, privatizePhis()).
++if (RT64_WGSL AND RT64_PREBUILT_SHADER_LIST)
++    find_program(RT64_SPIRV_OPT_EXECUTABLE spirv-opt)
++    if (NOT RT64_SPIRV_OPT_EXECUTABLE)
++        message(FATAL_ERROR "spirv-opt not found: the prebuilt shaders need it. Install SPIRV-Tools or set RT64_SPIRV_OPT_EXECUTABLE.")
++    endif()
++    add_subdirectory(src/tools/shader_specializer)
++    # A decal's pixel shader writes its depth bounds instead of reading the depth buffer (RasterPS.hlsl,
++    # DECAL_DEPTH_BOUNDS), so that it draws in the pass that writes depth: SPIR-V only, for these.
++    foreach(PREBUILT_DECAL_VARIANT "" "Flat" "DualSource" "FlatDualSource")
++        set(PREBUILT_DECAL_DEFINES "-D" "SPEC_CONSTANT_RENDER_PARAMS" "-D" "DECAL_DEPTH_BOUNDS")
++        if (PREBUILT_DECAL_VARIANT MATCHES "Flat")
++            list(APPEND PREBUILT_DECAL_DEFINES "-D" "VERTEX_FLAT_COLOR")
++        endif()
++        if (PREBUILT_DECAL_VARIANT MATCHES "DualSource")
++            list(APPEND PREBUILT_DECAL_DEFINES "-D" "DUAL_SOURCE_BLENDING")
++        endif()
++        add_dxc_command(${CMAKE_BINARY_DIR}/src/shaders/RasterPSSpecConstant${PREBUILT_DECAL_VARIANT}Decal.hlsl.wgsl.spv
++            ${PROJECT_SOURCE_DIR}/src/shaders/RasterPS.hlsl ${DXC_SPV_OPTS} -D WEBGPU ${DXC_PS_OPTS} ${PREBUILT_DECAL_DEFINES})
++    endforeach()
++    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${RT64_PREBUILT_SHADER_LIST})
++    file(STRINGS ${RT64_PREBUILT_SHADER_LIST} PREBUILT_LINES REGEX "^[0-9a-fA-F]+( +[0-9a-fA-F]+)( +[0-9a-fA-F]+)( +[0-9a-fA-F]+)( +[0-9a-fA-F]+)")
++    set(PREBUILT_DIR "${CMAKE_BINARY_DIR}/rt64_prebuilt_shaders")
++    set(PREBUILT_SPIRV "${CMAKE_BINARY_DIR}/src/shaders")
++    file(MAKE_DIRECTORY ${PREBUILT_DIR})
++    set(PREBUILT_OUTPUTS)
++    foreach(PREBUILT_LINE ${PREBUILT_LINES})
++        string(REGEX MATCHALL "[0-9a-fA-F]+" PREBUILT_WORDS "${PREBUILT_LINE}")
++        list(GET PREBUILT_WORDS 4 PREBUILT_FLAGS)
++        string(JOIN "_" PREBUILT_KEY ${PREBUILT_WORDS})
++        # The spec constants' ids are RT64's: other mode L and H, color combiner L and H, flags.
++        set(PREBUILT_SPEC_CONSTANTS)
++        set(PREBUILT_ID 0)
++        foreach(PREBUILT_WORD ${PREBUILT_WORDS})
++            math(EXPR PREBUILT_VALUE "0x${PREBUILT_WORD}" OUTPUT_FORMAT DECIMAL)
++            list(APPEND PREBUILT_SPEC_CONSTANTS "${PREBUILT_ID}:${PREBUILT_VALUE}")
++            math(EXPR PREBUILT_ID "${PREBUILT_ID} + 1")
++        endforeach()
++        string(JOIN " " PREBUILT_SPEC_CONSTANTS ${PREBUILT_SPEC_CONSTANTS})
++        # The flags' fourth bit is smoothShade, and other mode L's bits 10 and 11 both set are a decal (ZMODE_DEC).
++        math(EXPR PREBUILT_SMOOTH "(0x${PREBUILT_FLAGS} >> 3) & 1")
++        list(GET PREBUILT_WORDS 0 PREBUILT_OTHER_MODE_L)
++        math(EXPR PREBUILT_ZMODE "(0x${PREBUILT_OTHER_MODE_L} >> 10) & 3")
++        set(PREBUILT_PS_DECAL "")
++        if (PREBUILT_ZMODE EQUAL 3)
++            set(PREBUILT_PS_DECAL "Decal")
++        endif()
++        if (PREBUILT_SMOOTH)
++            set(PREBUILT_SPIRV_vs "${PREBUILT_SPIRV}/RasterVSSpecConstant.hlsl.wgsl.spv")
++            set(PREBUILT_SPIRV_ps "${PREBUILT_SPIRV}/RasterPSSpecConstantDualSource${PREBUILT_PS_DECAL}.hlsl.wgsl.spv")
++            set(PREBUILT_SPIRV_ps-single "${PREBUILT_SPIRV}/RasterPSSpecConstant${PREBUILT_PS_DECAL}.hlsl.wgsl.spv")
++        else()
++            set(PREBUILT_SPIRV_vs "${PREBUILT_SPIRV}/RasterVSSpecConstantFlat.hlsl.wgsl.spv")
++            set(PREBUILT_SPIRV_ps "${PREBUILT_SPIRV}/RasterPSSpecConstantFlatDualSource${PREBUILT_PS_DECAL}.hlsl.wgsl.spv")
++            set(PREBUILT_SPIRV_ps-single "${PREBUILT_SPIRV}/RasterPSSpecConstantFlat${PREBUILT_PS_DECAL}.hlsl.wgsl.spv")
++        endif()
++        set(PREBUILT_OUT "${PREBUILT_DIR}/${PREBUILT_KEY}")
++        set(PREBUILT_COMMANDS)
++        foreach(PREBUILT_STAGE vs ps ps-single)
++            list(APPEND PREBUILT_COMMANDS
++                COMMAND ${RT64_SPIRV_OPT_EXECUTABLE} --set-spec-const-default-value "${PREBUILT_SPEC_CONSTANTS}" --freeze-spec-const
++                    --fold-spec-const-op-composite --strip-debug -O -O ${PREBUILT_SPIRV_${PREBUILT_STAGE}} -o ${PREBUILT_OUT}.${PREBUILT_STAGE}.spv
++                COMMAND ${RT64_NAGA_EXECUTABLE} --input-kind spv --keep-coordinate-space ${PREBUILT_OUT}.${PREBUILT_STAGE}.spv ${PREBUILT_OUT}.${PREBUILT_STAGE}.wgsl)
++        endforeach()
++        add_custom_command(OUTPUT ${PREBUILT_OUT}.vs.wgsl ${PREBUILT_OUT}.ps.wgsl ${PREBUILT_OUT}.ps-single.wgsl
++            ${PREBUILT_COMMANDS}
++            DEPENDS ${PREBUILT_SPIRV_vs} ${PREBUILT_SPIRV_ps} ${PREBUILT_SPIRV_ps-single}
++            VERBATIM)
++        list(APPEND PREBUILT_OUTPUTS ${PREBUILT_OUT}.vs.wgsl ${PREBUILT_OUT}.ps.wgsl ${PREBUILT_OUT}.ps-single.wgsl)
++    endforeach()
++    add_custom_command(OUTPUT ${PREBUILT_DIR}/rt64_prebuilt_shaders.c
++        COMMAND shader_specializer pack ${RT64_PREBUILT_SHADER_LIST} ${PREBUILT_DIR} ${PREBUILT_DIR}/rt64_prebuilt_shaders.c "${PROJECT_SOURCE_DIR}/src/render/rt64_prebuilt_shaders.h"
++        DEPENDS shader_specializer ${RT64_PREBUILT_SHADER_LIST} ${PREBUILT_OUTPUTS})
++    target_sources(rt64 PRIVATE ${PREBUILT_DIR}/rt64_prebuilt_shaders.c)
++    target_compile_definitions(rt64 PRIVATE RT64_PREBUILT_SHADERS)
++endif()
+ build_compute_shader(rt64 "src/shaders/FbChangesClearCS.hlsl")
+ build_pixel_shader(  rt64 "src/shaders/FbChangesDrawColorPS.hlsl")
+ build_pixel_shader(  rt64 "src/shaders/FbChangesDrawDepthPS.hlsl")
+diff --git b/src/hle/rt64_application.cpp a/src/hle/rt64_application.cpp
+index 4e86d16..750549a 100644
+--- b/src/hle/rt64_application.cpp
++++ a/src/hle/rt64_application.cpp
+@@ -503,9 +503,12 @@ namespace RT64 {
+         // Pokemon Snap port: warm every shader this machine has ever seen,
+         // during boot on the idle compile workers, so a Pokemon's first
+         // steps on screen never pay for pipeline creation.
++        // A page builds its prebuilt shader list for that, and remembers the shaders the list missed itself.
++#   ifndef __EMSCRIPTEN__
+         if (!userPaths.isEmpty()) {
+             rasterShaderCache->openSeenList(userPaths.shaderCachePath.parent_path() / "rt64-seen-shaders.bin");
+         }
++#   endif
+ 
+ #   if RT_ENABLED
+         if (device->getCapabilities().raytracing) {
+diff --git b/src/hle/rt64_game_frame.cpp a/src/hle/rt64_game_frame.cpp
+index c1e8775..ed53317 100644
+--- b/src/hle/rt64_game_frame.cpp
++++ a/src/hle/rt64_game_frame.cpp
+@@ -184,6 +184,55 @@ namespace RT64 {
+         return (lhs.first < rhs.first) || ((lhs.first == rhs.first) && lhs.second < rhs.second);
+     }
+ 
++    // Sorts the pairs in the order operator< gives and drops the repeats. Each pair becomes a 64-bit key that sorts the same way,
++    // and the keys are sorted a byte at a time, skipping the bytes no key uses: the indices are small, so that is a few passes.
++    static void sortUniqueIndexPairs(std::vector<IndexPair> &pairs) {
++        thread_local std::vector<uint64_t> keys;
++        thread_local std::vector<uint64_t> sortedKeys;
++        const size_t count = pairs.size();
++        keys.resize(count);
++        sortedKeys.resize(count);
++        uint64_t keyBits = 0;
++        for (size_t i = 0; i < count; i++) {
++            keys[i] = (uint64_t(pairs[i].first) << 32) | pairs[i].second;
++            keyBits |= keys[i];
++        }
++
++        for (uint32_t shift = 0; shift < 64; shift += 8) {
++            // A byte that is zero in every key leaves the order as it is.
++            if (((keyBits >> shift) & 0xFFU) == 0) {
++                continue;
++            }
++
++            uint32_t offsets[256] = {};
++            for (size_t i = 0; i < count; i++) {
++                offsets[(keys[i] >> shift) & 0xFFU]++;
++            }
++
++            uint32_t offset = 0;
++            for (uint32_t &o : offsets) {
++                const uint32_t bucketCount = o;
++                o = offset;
++                offset += bucketCount;
++            }
++
++            for (size_t i = 0; i < count; i++) {
++                sortedKeys[offsets[(keys[i] >> shift) & 0xFFU]++] = keys[i];
++            }
++
++            keys.swap(sortedKeys);
++        }
++
++        size_t uniqueCount = 0;
++        for (size_t i = 0; i < count; i++) {
++            if ((i == 0) || (keys[i] != keys[i - 1])) {
++                pairs[uniqueCount++] = IndexPair(uint32_t(keys[i] >> 32), uint32_t(keys[i]));
++            }
++        }
++
++        pairs.resize(uniqueCount);
++    }
++
+     struct MatchCandidate {
+         uint32_t curIndex = 0;
+         uint32_t prevIndex = 0;
+@@ -686,8 +735,10 @@ namespace RT64 {
+             return;
+         }
+ 
+-        thread_local std::multimap<uint64_t, GameCallMap> curCallHashMap;
+-        thread_local std::multimap<uint64_t, GameCallMap> prevCallHashMap;
++        // Sorted vectors rather than multimaps and sets: they are rebuilt for every scene of every frame, and the
++        // node allocations were most of this thread's time. Sorted the same way, so they are visited in the same order.
++        thread_local std::vector<std::pair<uint64_t, GameCallMap>> curCallHashMap;
++        thread_local std::vector<std::pair<uint64_t, GameCallMap>> prevCallHashMap;
+         curCallHashMap.clear();
+         prevCallHashMap.clear();
+ 
+@@ -847,17 +898,24 @@ namespace RT64 {
+             buildCallHashMap(p, prevWorkload, prevProj, prevCallHashMap);
+         }
+ 
++        // As a multimap orders them: by hash, and calls with the same hash in the order they were added.
++        auto byHash = [](const std::pair<uint64_t, GameCallMap> &lhs, const std::pair<uint64_t, GameCallMap> &rhs) {
++            return lhs.first < rhs.first;
++        };
++        std::stable_sort(curCallHashMap.begin(), curCallHashMap.end(), byHash);
++        std::stable_sort(prevCallHashMap.begin(), prevCallHashMap.end(), byHash);
++
+         // FIXME: Transform set needs to be done per unique workload detected.
+-        thread_local std::set<IndexPair> transformCheckSet;
+-        thread_local std::set<IndexPair> tileCheckSet;
+-        thread_local std::set<IndexPair> lookAtCheckSet;
++        thread_local std::vector<IndexPair> transformCheckSet;
++        thread_local std::vector<IndexPair> tileCheckSet;
++        thread_local std::vector<IndexPair> lookAtCheckSet;
+         transformCheckSet.clear();
+         tileCheckSet.clear();
+         lookAtCheckSet.clear();
+ 
+         // Traverse the map and fill the set with all the combinations of transforms to check.
+         for (std::pair<uint64_t, GameCallMap> curIt : curCallHashMap) {
+-            auto prevRange = prevCallHashMap.equal_range(curIt.first);
++            auto prevRange = std::equal_range(prevCallHashMap.begin(), prevCallHashMap.end(), std::pair<uint64_t, GameCallMap>{ curIt.first, {} }, byHash);
+             for (auto prevIt = prevRange.first; prevIt != prevRange.second; prevIt++) {
+                 const GameIndices::Projection &curProjIndices = curScene.projections[curIt.second.sceneProjIndex];
+                 const Workload &curWorkload = workloadQueue.workloads[curProjIndices.workloadIndex];
+@@ -880,7 +938,7 @@ namespace RT64 {
+                         const uint32_t prevGroupIndex = prevWorkload.drawData.worldTransformGroups[prevWorldMatrix];
+                         const TransformGroup &prevGroup = prevWorkload.drawData.transformGroups[prevGroupIndex];
+                         if ((curGroup.matrixId == prevGroup.matrixId) && ((curGroup.matrixId == G_EX_ID_AUTO) || ((curGroup.matrixId != G_EX_ID_IGNORE) && (curGroup.ordering == G_EX_ORDER_AUTO)))) {
+-                            transformCheckSet.emplace(curWorldMatrix, prevWorldMatrix);
++                            transformCheckSet.emplace_back(curWorldMatrix, prevWorldMatrix);
+                         }
+                     }
+                 }
+@@ -894,7 +952,7 @@ namespace RT64 {
+                             continue;
+                         }
+ 
+-                        tileCheckSet.emplace(curCall.callDesc.tileIndex + t, prevCall.callDesc.tileIndex + t);
++                        tileCheckSet.emplace_back(curCall.callDesc.tileIndex + t, prevCall.callDesc.tileIndex + t);
+                     }
+                 }
+ 
+@@ -907,11 +965,16 @@ namespace RT64 {
+                     const uint32_t prevVertexIndex = prevWorkload.drawData.faceIndices[prevCall.meshDesc.faceIndicesStart];
+                     const uint32_t curLookAtIndex = curWorkload.drawData.lookAtIndices[curVertexIndex] >> RSP_LOOKAT_INDEX_SHIFT;
+                     const uint32_t prevLookAtIndex = prevWorkload.drawData.lookAtIndices[prevVertexIndex] >> RSP_LOOKAT_INDEX_SHIFT;
+-                    lookAtCheckSet.emplace(curLookAtIndex, prevLookAtIndex);
++                    lookAtCheckSet.emplace_back(curLookAtIndex, prevLookAtIndex);
+                 }
+             }
+         }
+ 
++        // Sorted and without repeats, as the sets were.
++        for (std::vector<IndexPair> *checkSet : { &transformCheckSet, &tileCheckSet, &lookAtCheckSet }) {
++            sortUniqueIndexPairs(*checkSet);
++        }
++
+         // Compute all the differences between transforms and insert them into a vector that will be sorted according to the differences.
+         thread_local std::vector<MatchCandidate> matchCandidates;
+         matchCandidates.clear();
+@@ -2223,7 +2286,7 @@ namespace RT64 {
+         }
+     }
+     
+-    void GameFrame::buildCallHashMap(uint32_t sceneProjIndex, const Workload &workload, const Projection &proj, std::multimap<uint64_t, GameCallMap> &hashMap) const {
++    void GameFrame::buildCallHashMap(uint32_t sceneProjIndex, const Workload &workload, const Projection &proj, std::vector<std::pair<uint64_t, GameCallMap>> &hashMap) const {
+         for (uint32_t c = 0; c < proj.gameCallCount; c++) {
+             const GameCall &call = proj.gameCalls[c];
+             uint32_t matrixIdHash = 0;
+@@ -2241,7 +2304,7 @@ namespace RT64 {
+                 doTileMatching = doTileMatching || (group.tileInterpolation == G_EX_COMPONENT_AUTO);
+             }
+ 
+-            hashMap.emplace(hashFromCall(call, matrixIdHash), GameCallMap{ sceneProjIndex, c, doTransformMatching, doTileInterpolation, doTileMatching });
++            hashMap.emplace_back(hashFromCall(call, matrixIdHash), GameCallMap{ sceneProjIndex, c, doTransformMatching, doTileInterpolation, doTileMatching });
+         }
+     }
+ 
+diff --git b/src/hle/rt64_game_frame.h a/src/hle/rt64_game_frame.h
+index b1c72b1..d400fee 100644
+--- b/src/hle/rt64_game_frame.h
++++ a/src/hle/rt64_game_frame.h
+@@ -165,7 +165,7 @@ namespace RT64 {
+         // shader can blend a colour the game steps once per frame. Returns
+         // whether any call's parameters were changed.
+         static bool snapMatchPrimColors(Workload &curWorkload, const Workload &prevWorkload, const GameFrameMap::WorkloadMap &curWorkloadMap);
+-        void buildCallHashMap(uint32_t sceneProjIndex, const Workload &workload, const Projection &proj, std::multimap<uint64_t, GameCallMap> &hashMap) const;
++        void buildCallHashMap(uint32_t sceneProjIndex, const Workload &workload, const Projection &proj, std::vector<std::pair<uint64_t, GameCallMap>> &hashMap) const;
+         void buildTransformIdMap(const Workload &workload, std::multimap<uint32_t, uint32_t> &idMap, std::vector<uint32_t> &ignoredIdVector) const;
+         uint64_t hashFromCall(const GameCall &call, uint32_t matrixIdHash) const;
+         bool isDebuggerCameraEnabled(const WorkloadQueue &workloadQueue);
+diff --git b/src/hle/rt64_present_queue.cpp a/src/hle/rt64_present_queue.cpp
+index d2b8116..c239814 100644
+--- b/src/hle/rt64_present_queue.cpp
++++ a/src/hle/rt64_present_queue.cpp
+@@ -7,6 +7,10 @@
+ #include "common/rt64_thread.h"
+ #include "rhi/rt64_render_hooks.h"
+ 
++#if defined(__EMSCRIPTEN__)
++#   include <emscripten.h>
++#endif
++
+ #include "rt64_workload_queue.h"
+ #include "rt64_snap_diag.h"
+ #include "rt64_snap_overlay.h"
+@@ -372,6 +376,12 @@ namespace {
+     }
+ 
+     void PresentQueue::advanceToNextPresent() {
++        // For present-stats, when the present was queued: before the stall below, which waits only while the present
++        // thread is the whole queue behind.
++        if (presentStats) {
++            presentQueued[writeCursor] = Timer::current();
++        }
++
+         int nextWriteCursor = (writeCursor + 1) % presents.size();
+ 
+         // Stall the thread until the barrier is lifted if we're trying to write on a present being used by the GPU.
+@@ -424,6 +434,15 @@ namespace {
+ 
+         viRenderer = std::make_unique<VIRenderer>();
+ 
++#   if defined(__EMSCRIPTEN__)
++        // A page opened with ?uncapped measures how many presents a second it can make: plume reports the display's rate
++        // as the query's (360), the frames are interpolated to it, and none are paced (pace()), so that what the GPU
++        // and the browser can take is what is presented. The interpolated frames take turns in 8 color targets of the
++        // game's framebuffer at the output's scale (WorkloadQueue's InterpolatedTargetSlots), 0.25-0.55 GB at 3840x2000.
++        uncapped = MAIN_THREAD_EM_ASM_INT({ return new URLSearchParams(location.search).has('uncapped') ? 1 : 0; }) != 0;
++        presentStats = MAIN_THREAD_EM_ASM_INT({ return new URLSearchParams(location.search).has('present-stats') ? 1 : 0; }) != 0;
++#   endif
++
+         presentThreadRunning = true;
+         presentThread = new std::thread(&PresentQueue::threadLoop, this);
+     }
+@@ -460,6 +479,12 @@ namespace {
+             targetRate = ext.sharedResources->targetRate;
+         }
+ 
++        // Presents are paced to a lower rate while the GPU can't keep up (pace()).
++        const uint32_t pacedRate = ext.sharedResources->pacedRate;
++        if ((pacedRate > 0) && (pacedRate < targetRate)) {
++            targetRate = pacedRate;
++        }
++
+         RenderTarget *colorTarget = nullptr;
+         int32_t framesToPresent = 1;
+         bool lockedWorkloadMutex = false;
+@@ -683,6 +708,7 @@ namespace {
+             if ((framesToPresent > 1) && (usingMSAA || (i > 0))) {
+                 // Stall until the interpolated color target is available.
+                 const uint32_t targetIndex = usingMSAA ? i : (i - 1);
++                PhaseTimer phaseTimer(this, PhaseInterpolated);
+                 std::unique_lock<std::mutex> interpolatedLock(ext.sharedResources->interpolatedMutex);
+                 ext.sharedResources->interpolatedCondition.wait(interpolatedLock, [&]() {
+                     return (frameCounters.available > targetIndex) || ((frameCounters.available == targetIndex) && frameCounters.skipped);
+@@ -699,7 +725,8 @@ namespace {
+ 
+                 if (i < framesToPresent) {
+                     uint32_t targetIndex = usingMSAA ? i : (i - 1);
+-                    colorTarget = ext.sharedResources->interpolatedColorTargets[targetIndex].get();
++                    const auto &interpolatedTargets = ext.sharedResources->interpolatedColorTargets;
++                    colorTarget = interpolatedTargets[targetIndex % interpolatedTargets.size()].get();
+                 }
+                 else {
+                     colorTarget = nullptr;
+@@ -723,7 +750,9 @@ namespace {
+             snapPTInterp = std::chrono::steady_clock::now();
+             uint32_t swapChainIndex = 0;
+             const bool presentFrame = (i < framesToPresent) && swapChainValid;
++            std::optional<PhaseTimer> drawTimer;
+             if (presentFrame) {
++                drawTimer.emplace(this, PhaseDraw);
+                 swapChainValid = ext.swapChain->acquireTexture(acquiredSemaphore.get(), &swapChainIndex);
+             }
+             snapPTAcquire = std::chrono::steady_clock::now();
+@@ -929,6 +958,7 @@ namespace {
+             }
+ 
+             snapPTWork = std::chrono::steady_clock::now();
++            drawTimer.reset();
+             if (lockedWorkloadMutex) {
+                 ext.sharedResources->workloadMutex.unlock();
+                 lockedWorkloadMutex = false;
+@@ -989,17 +1019,57 @@ namespace {
+                     }
+                 }
+ 
++#           if defined(__EMSCRIPTEN__)
++                // On a page the browser presents on its animation frames, so the timer spaces every interpolated
++                // present, on the fixed timeline below, whatever the display's rate.
++                if ((presentTimestamp != Timestamp()) && (targetRate > 0) && (targetRate > viOriginalRate)) {
++#           else
+                 if (softwarePaced && (presentTimestamp != Timestamp())) {
++#           endif
++#               if defined(__EMSCRIPTEN__)
++                    // On a fixed timeline: each present's slot is one period after the last one's, not after the moment
++                    // it went out, so the time spent past a slot (the sleep waking on the browser's timer, wait()'s trip
++                    // to the page's thread) isn't added to every period. In Chrome the pages of games below the
++                    // display's rate presented every 18 ms, 55.6 a second, where those at its rate, which never sleep
++                    // here, presented 60. A present a whole period past its slot or more starts the slots from itself.
++                    // Where the swap chain learns of the display's frames as they come (WebGPU), the wait ends on one.
++                    const auto presentPeriod = std::chrono::nanoseconds(1'000'000'000 / targetRate);
++                    if ((presentSlot == Timestamp()) || ((presentTimestamp - presentSlot) >= presentPeriod)) {
++                        presentSlot = presentTimestamp;
++                    }
++
++                    presentSlot += presentPeriod;
++                    const bool slotAhead = presentStats && (presentSlot > Timer::current());
++                    {
++                        PhaseTimer phaseTimer(this, PhaseSleep);
++                        if (!ext.swapChain->sleepUntil(std::chrono::steady_clock::now() + (presentSlot - Timer::current()))) {
++                            Timer::preciseSleepUntil(presentSlot);
++                        }
++                    }
++
++                    // Only a sleep that had a slot to wait for woke past it: one already past (after a stall) didn't sleep.
++                    if (slotAhead) {
++                        busyLateMicro += std::max(Timer::deltaMicroseconds(presentSlot, Timer::current()), int64_t(0));
++                    }
++#               else
+                     Timer::preciseSleepUntil(presentTimestamp + std::chrono::nanoseconds(1'000'000'000 / targetRate));
++#               endif
+                 }
++#           if defined(__EMSCRIPTEN__)
++                else {
++                    presentSlot = Timestamp();
++                }
++#           endif
+ 
+                 if (presentWaitEnabled) {
++                    PhaseTimer phaseTimer(this, PhaseWait);
+                     ext.swapChain->wait();
+                 }
+ 
+                 RenderCommandSemaphore *waitSemaphore = drawSemaphores[swapChainIndex].get();
+                 const Timestamp previousPresentTimestamp = presentTimestamp;
+                 presentTimestamp = Timer::current();
++                PhaseTimer phaseTimer(this, PhasePresent);
+                 swapChainValid = ext.swapChain->present(swapChainIndex, &waitSemaphore, 1);
+                 presentProfiler.logAndRestart();
+ 
+@@ -1297,6 +1367,186 @@ namespace {
+         ext.sharedResources->interpolatedCondition.notify_all();
+     }
+ 
++    // Frames interpolated to the display's rate are drawn for evenly spaced moments, so motion looks even only if each
++    // is presented. When the GPU can't keep up, a game frame whose present is still waiting behind the next one is
++    // dropped whole, and the rest get one, two or three presents: some frames shown three times, some never. That
++    // happens in Chrome and Firefox alike on a laptop's integrated graphics. So while frames are being dropped (one
++    // present in ten or more over 2 s, 4 at least), each game frame gets fewer presents, a number that divides the
++    // display's rate evenly (a 30 fps game on a 60 Hz display: 1, at 30 a second), and a while later it tries the
++    // number above again: after 10 s, twice as long each time it falls straight back (2 min at most). The number is
++    // kept, not the rate, since a game's own rate moves (Banjo-Kazooie's between 20 and 30). A present dropped now and
++    // then is not the GPU falling behind: a pipeline built behind the game (Chrome) drops one every second or two, and
++    // counting those (2 in a second) held GoldenEye's cast credits, 8-12 game frames a second, at one present a frame
++    // for 10-30 s. Nor is a burst of a few: presents stop while the game waits for prebuilt shaders, come through at once
++    // after, and the GPU is busy for a moment with what it was given, so drops are counted over a whole 2 s of presents,
++    // never fewer: judged on the first few dozen after a wait, or after a try of the number above (which starts the count
++    // again), 4 dropped were enough, and Donkey Kong 64 in Firefox went to 30 presents a second right after its boot's
++    // wait and stayed there for 70 s, each try falling straight back. And the count starts again a second after any such
++    // wait ends: a wait shorter than 2 s left presents from before it in the count beside the burst after it, and
++    // Banjo-Kazooie in Chrome went to 30 a second 0.4 s after its 1.5 s wait, for 10 s. A game at about the display's
++    // rate (a launcher's 60 on a 59-61 Hz display) has nothing to be paced to, and its drops while a page loads aren't
++    // counted either. Nor is a page opened with ?uncapped paced, which drops presents by design.
++    // A page opened with ?present-stats prints where the present thread's time went before each present it drops
++    // (reportDroppedPresent()).
++    void PresentQueue::pace(bool presentDropped) {
++        const uint32_t targetRate = ext.sharedResources->targetRate;
++        const uint32_t originalRate = ext.sharedResources->viOriginalRate;
++        auto setPacedRate = [&](uint32_t pacedRate) {
++            if ((pacedRate == 0) != (ext.sharedResources->pacedRate == 0)) {
++                const char *what = (pacedRate > 0) ? "paced to the game's frames while the GPU falls behind" : "back at the display's rate";
++                printf("RT64: presents %s (the game at %u frames a second)\n", what, originalRate);
++            }
++
++            ext.sharedResources->pacedRate = pacedRate;
++        };
++
++        // Whether a number of presents a game frame is fewer than the display's rate gives it (by more than 5%), and
++        // whether it is spaced evenly on the display: the display's rate a whole multiple of the presents' (within 5%,
++        // for a 59 Hz display), or one a frame.
++        auto isFewer = [&](uint32_t multiple) {
++            return (multiple * originalRate * 20) < (targetRate * 19);
++        };
++
++        if (uncapped || (targetRate == 0) || (originalRate == 0) || !isFewer(1)) {
++            pacingMultiple = 0;
++            pacingPresents.clear();
++            pacingDropped = 0;
++            setPacedRate(0);
++            return;
++        }
++
++        auto isEven = [&](uint32_t multiple) {
++            const uint32_t rate = multiple * originalRate;
++            const uint32_t whole = (targetRate + rate / 2) / rate;
++            return (multiple == 1) || ((whole > 0) && (uint32_t(std::abs(int(targetRate) - int(whole * rate))) * 20 <= targetRate));
++        };
++
++        // The most presents a game frame can get that are fewer and even, at most a number, or one.
++        auto pacedMultipleAtMost = [&](uint32_t multiple) {
++            while ((multiple > 1) && (!isFewer(multiple) || !isEven(multiple))) {
++                multiple--;
++            }
++
++            return std::max(multiple, 1U);
++        };
++
++        const Timestamp now = Timer::current();
++        const int64_t minRetryMicro = 10'000'000;
++        const int64_t maxRetryMicro = 120'000'000;
++        const int64_t fallBackMicro = 3'000'000;
++        if (pacingRetryMicro == 0) {
++            pacingRetryMicro = minRetryMicro;
++            pacingChanged = now;
++        }
++
++        const uint32_t prebuildWaits = ext.sharedResources->prebuildWaits;
++        if (prebuildWaits != pacingPrebuildWaits) {
++            pacingPrebuildWaits = prebuildWaits;
++            pacingPrebuildWaited = now;
++        }
++
++        if ((pacingPrebuildWaited != Timestamp()) && (Timer::deltaMicroseconds(pacingPrebuildWaited, now) < 1'000'000)) {
++            pacingPresents.clear();
++            pacingDropped = 0;
++            return;
++        }
++
++        pacingPresents.emplace_back(now, presentDropped);
++        pacingDropped += presentDropped ? 1 : 0;
++        while (Timer::deltaMicroseconds(pacingPresents.front().first, now) > 2'000'000) {
++            pacingDropped -= pacingPresents.front().second ? 1 : 0;
++            pacingPresents.pop_front();
++        }
++
++        const bool wholeWindow = Timer::deltaMicroseconds(pacingPresents.front().first, now) >= 1'900'000;
++        const bool fallingBehind = wholeWindow && (pacingDropped >= 4) && ((pacingDropped * 10) >= pacingPresents.size());
++        const int64_t sinceChange = Timer::deltaMicroseconds(pacingChanged, now);
++        if (fallingBehind && (pacingMultiple != 1)) {
++            pacingMultiple = pacedMultipleAtMost((pacingMultiple > 0) ? (pacingMultiple - 1) : (targetRate / originalRate));
++
++            if ((pacingRaised != Timestamp()) && (Timer::deltaMicroseconds(pacingRaised, now) < fallBackMicro)) {
++                pacingRetryMicro = std::min(pacingRetryMicro * 2, maxRetryMicro);
++            }
++
++            pacingPresents.clear();
++            pacingDropped = 0;
++            pacingChanged = now;
++        }
++        else if ((pacingMultiple > 0) && (sinceChange >= pacingRetryMicro)) {
++            do {
++                pacingMultiple++;
++            } while (isFewer(pacingMultiple) && !isEven(pacingMultiple));
++
++            if (!isFewer(pacingMultiple)) {
++                pacingMultiple = 0;
++            }
++
++            pacingPresents.clear();
++            pacingDropped = 0;
++            pacingChanged = now;
++            pacingRaised = now;
++        }
++        else if ((pacingMultiple == 0) && (sinceChange >= maxRetryMicro)) {
++            pacingRetryMicro = minRetryMicro;
++        }
++
++        // The game's rate may have moved since the number was picked, so it is the even number at most that large.
++        setPacedRate((pacingMultiple > 0) ? (pacedMultipleAtMost(pacingMultiple) * originalRate) : 0);
++    }
++
++    PresentQueue::PhaseTimer::PhaseTimer(PresentQueue *queue, PresentPhase phase) : queue(queue), phase(phase) {
++        if (queue->presentStats) {
++            start = Timer::current();
++        }
++    }
++
++    PresentQueue::PhaseTimer::~PhaseTimer() {
++        if (queue->presentStats) {
++            queue->busyPhaseMicro[phase] += Timer::deltaMicroseconds(start, Timer::current());
++        }
++    }
++
++    void PresentQueue::resetBusyFrames() {
++        busyPhaseMicro.fill(0);
++        busyLateMicro = 0;
++        busyFrames = 0;
++        busyStart = Timer::current();
++    }
++
++    // With present-stats, a line for each present dropped because the next was already queued behind it (what pace()
++    // counts): how long it waited, and where the present thread's time went in the game frames since it last waited for
++    // a present or dropped one, as each frame's share: waiting for its workload, for the next interpolated frame, drawing
++    // and submitting each present, sleeping until each one's slot (and how far past the slots it woke), wait() (for
++    // fewer presents in flight, and the trips to the device thread it makes to ask), the present() calls, and the rest.
++    // The thread fell a game frame behind in those frames, so what grew in them is what dropped the present.
++    void PresentQueue::reportDroppedPresent(int droppedCursor, int nextCursor) {
++        const Timestamp now = Timer::current();
++        const double waitedMs = Timer::deltaMicroseconds(presentQueued[droppedCursor], now) / 1000.0;
++        const double nextMs = Timer::deltaMicroseconds(presentQueued[droppedCursor], presentQueued[nextCursor]) / 1000.0;
++        if (busyFrames == 0) {
++            printf("RT64: present dropped (it waited %.1f ms, the next came %.1f ms after it)\n", waitedMs, nextMs);
++        }
++        else {
++            const double frameMs = Timer::deltaMicroseconds(busyStart, now) / 1000.0 / busyFrames;
++            auto phaseMs = [&](PresentPhase phase) {
++                return busyPhaseMicro[phase] / 1000.0 / busyFrames;
++            };
++
++            double restMs = frameMs;
++            for (uint32_t p = 0; p < PhaseCount; p++) {
++                restMs -= phaseMs(PresentPhase(p));
++            }
++
++            printf("RT64: present dropped (it waited %.1f ms, the next came %.1f ms after it); the %u game frames before it "
++                "since the present thread last waited took %.1f ms each: workload %.1f, interpolated %.1f, draw %.1f, "
++                "sleep %.1f (%.1f past the slots), wait() %.1f, present() %.1f, the rest %.1f\n",
++                waitedMs, nextMs, busyFrames, frameMs, phaseMs(PhaseWorkload), phaseMs(PhaseInterpolated), phaseMs(PhaseDraw),
++                phaseMs(PhaseSleep), busyLateMicro / 1000.0 / busyFrames, phaseMs(PhaseWait), phaseMs(PhasePresent), restMs);
++        }
++
++        resetBusyFrames();
++    }
++
+     void PresentQueue::notifyPresentId(const Present &present) {
+         {
+             std::scoped_lock<std::mutex> cursorLock(presentIdMutex);
+@@ -1331,8 +1581,10 @@ namespace {
+         const bool displayTiming = ext.device->getCapabilities().displayTiming;
+         bool swapChainValid = !ext.swapChain->needsResize();
+         while (presentThreadRunning) {
++            bool waited = false;
+             {
+                 std::unique_lock<std::mutex> cursorLock(cursorMutex);
++                waited = (writeCursor == threadCursor);
+                 cursorCondition.wait(cursorLock, [&]() {
+                     return (writeCursor != threadCursor) || !presentThreadRunning;
+                 });
+@@ -1344,6 +1596,22 @@ namespace {
+                 }
+             }
+ 
++            // present-stats: a game frame ended at each present the thread came to without waiting for it, unless the one
++            // before was dropped (a second of a burst, reported without the frames).
++            if (presentStats && (processCursor >= 0)) {
++                if (waited) {
++                    resetBusyFrames();
++                }
++                else if (!lastPresentDropped) {
++                    busyFrames++;
++                }
++
++                lastPresentDropped = skipPresent;
++                if (skipPresent) {
++                    reportDroppedPresent(processCursor, threadCursor);
++                }
++            }
++
+             if (processCursor >= 0) {
+                 std::unique_lock<std::mutex> threadLock(threadMutex);
+                 const bool needsResize = ext.swapChain->needsResize() || !swapChainValid;
+@@ -1392,12 +1660,19 @@ namespace {
+                 skipPresent = skipPresent || ext.swapChain->isEmpty();
+ 
+                 Present &present = presents[processCursor];
+-                ext.workloadQueue->waitForWorkloadId(present.workloadId);
++                {
++                    PhaseTimer phaseTimer(this, PhaseWorkload);
++                    ext.workloadQueue->waitForWorkloadId(present.workloadId);
++                }
+ 
+                 if (!presentThreadRunning) {
+                     continue;
+                 }
+ 
++#           if defined(__EMSCRIPTEN__)
++                pace(skipPresent && !ext.swapChain->isEmpty());
++#           endif
++
+                 if (skipPresent) {
+                     skipInterpolation();
+                     notifyPresentId(present);
+diff --git b/src/hle/rt64_present_queue.h a/src/hle/rt64_present_queue.h
+index 34bf666..701cad0 100644
+--- b/src/hle/rt64_present_queue.h
++++ a/src/hle/rt64_present_queue.h
+@@ -4,6 +4,10 @@
+ 
+ #pragma once
+ 
++#include <array>
++#include <deque>
++#include <optional>
++
+ #include "common/rt64_profiling_timer.h"
+ #include "gui/rt64_inspector.h"
+ #include "render/rt64_vi_renderer.h"
+@@ -66,6 +70,37 @@ namespace RT64 {
+         // creation default.
+         bool swapChainVsyncEnabled = false;
+         bool swapChainVsyncKnown = false;
++        uint32_t pacingMultiple = 0;
++        std::deque<std::pair<Timestamp, bool>> pacingPresents;
++        uint32_t pacingDropped = 0;
++        Timestamp pacingChanged;
++        Timestamp pacingRaised;
++        int64_t pacingRetryMicro = 0;
++        uint32_t pacingPrebuildWaits = 0;
++        Timestamp pacingPrebuildWaited;
++        bool uncapped = false;
++        Timestamp presentSlot;
++
++        // present-stats (?present-stats): when each present was queued, and where the present thread's time went in the
++        // game frames since it last waited for one or dropped one, which it prints at each one it drops (threadLoop()).
++        enum PresentPhase { PhaseWorkload, PhaseInterpolated, PhaseDraw, PhaseSleep, PhaseWait, PhasePresent, PhaseCount };
++        bool presentStats = false;
++        std::array<Timestamp, PRESENT_QUEUE_SIZE> presentQueued;
++        std::array<int64_t, PhaseCount> busyPhaseMicro = {};
++        int64_t busyLateMicro = 0;
++        uint32_t busyFrames = 0;
++        bool lastPresentDropped = false;
++        Timestamp busyStart;
++
++        // Adds the time until the end of its scope to a phase, while present-stats is on.
++        struct PhaseTimer {
++            PresentQueue *queue;
++            PresentPhase phase;
++            Timestamp start;
++
++            PhaseTimer(PresentQueue *queue, PresentPhase phase);
++            ~PhaseTimer();
++        };
+ 
+         PresentQueue();
+         ~PresentQueue();
+@@ -78,6 +113,9 @@ namespace RT64 {
+         void setup(const External &ext);
+         void threadPresent(const Present &present, bool &swapChainValid);
+         void skipInterpolation();
++        void pace(bool presentDropped);
++        void resetBusyFrames();
++        void reportDroppedPresent(int droppedCursor, int nextCursor);
+         void notifyPresentId(const Present &present);
+         void threadAdvanceBarrier();
+         void threadLoop();
+diff --git b/src/hle/rt64_state.cpp a/src/hle/rt64_state.cpp
+index 6d41c9a..56e2c10 100644
+--- b/src/hle/rt64_state.cpp
++++ a/src/hle/rt64_state.cpp
+@@ -8,6 +8,12 @@
+ #include <cinttypes>
+ 
+ #include "rt64_snap_diag.h"
++#include <algorithm>
++#include <cstring>
++
++#if defined(_MSC_VER) && !defined(__clang__)
++#   include <intrin.h>
++#endif
+ 
+ #include "im3d/im3d.h"
+ #include "im3d/im3d_math.h"
+@@ -86,6 +92,8 @@ namespace RT64 {
+         displayListAddress = 0;
+         displayListCounter = 0;
+         rdramCheckPending = true;
++        pendingRAMCopies.clear();
++        pendingRAMImages.clear();
+         workloadCounter = 0;
+         lastScreenHash = 0;
+         lastScreenFactorCounter = 0;
+@@ -658,6 +666,8 @@ namespace RT64 {
+     }
+     
+     void State::checkRDRAM() {
++        landRAMCopies(false);
++
+         if (!rdramCheckPending) {
+             return;
+         }
+@@ -840,6 +850,120 @@ namespace RT64 {
+         }
+     }
+     
++    // Writes a word of RDRAM only if it still holds what it's expected to, in one step, so that a word the CPU writes
++    // at the same time keeps the CPU's value.
++    static bool replaceRDRAMWord(uint32_t *word, uint32_t expected, uint32_t desired) {
++#   if defined(_MSC_VER) && !defined(__clang__)
++        return _InterlockedCompareExchange(reinterpret_cast<volatile long *>(word), long(desired), long(expected)) == long(expected);
++#   else
++        return __atomic_compare_exchange_n(word, &expected, desired, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
++#   endif
++    }
++
++    void State::addPendingRAMCopy(Framebuffer *fb, uint32_t rowWidth, uint32_t rowStart, uint32_t rowEnd) {
++        pendingRAMCopies.push_back({ fb->addressStart, rowWidth, rowStart, rowEnd });
++
++        // The list hasn't completed, so the game hasn't touched the framebuffer's memory since it was drawn: this is
++        // what the copy must find there when it lands.
++        PendingRAMImage &image = pendingRAMImages[fb->addressStart];
++        if (image.words.empty()) {
++            image.start = fb->addressStart & ~3U;
++        }
++
++        const uint32_t end = fb->addressStart + std::max(fb->RAMBytes, rowEnd * fb->imageRowBytes(rowWidth));
++        const size_t wordCount = (end - image.start + 3) / 4;
++        const size_t oldWordCount = image.words.size();
++        if (wordCount > oldWordCount) {
++            image.words.resize(wordCount);
++            memcpy(&image.words[oldWordCount], &RDRAM[image.start + oldWordCount * 4], (wordCount - oldWordCount) * 4);
++        }
++    }
++
++    void State::landRAMCopies(bool onlyIfReady) {
++        if (pendingRAMCopies.empty()) {
++            return;
++        }
++
++        if (onlyIfReady) {
++            for (const PendingRAMCopy &copy : pendingRAMCopies) {
++                Framebuffer *fb = framebufferManager.find(copy.address);
++                if ((fb != nullptr) && !fb->nativeTarget.isNextCopyToRAMReady()) {
++                    return;
++                }
++            }
++        }
++
++        ext.framebufferGraphicsWorker->wait();
++
++        // The game has had the list's completion and runs meanwhile, so it may have reused a framebuffer's memory. Each
++        // frame is converted outside RDRAM and written in a word at a time, only where RDRAM still holds what it held
++        // when the list ended: a framebuffer the CPU wrote to before its copy lands keeps all of what it holds, and one
++        // the CPU writes to while its copy lands keeps every word the CPU wrote, the copy stopping there. Either way
++        // the next list sees the framebuffer as changed, as it would any other change the CPU made. A word the CPU
++        // wrote with the value it already held can't be told from one left alone, and gets the frame: a game whose
++        // reuse of a framebuffer's memory relies on that (zeroes written over zeroes) can't take the copy late.
++        auto reportCpuWrite = [this](uint32_t address, bool whileLanding) {
++            lateRAMCopyCpuWrites++;
++            const uint32_t n = lateRAMCopyCpuWrites;
++            if ((n <= 16) || ((n & (n - 1)) == 0)) {
++                fprintf(stderr, "RT64: the CPU wrote to the framebuffer at 0x%08X %s its frame was copied to RAM a list late; it keeps what the CPU wrote (%u times so far)\n",
++                    address, whileLanding ? "while" : "before", n);
++            }
++        };
++
++        thread_local std::vector<uint32_t> landedWords;
++        for (const PendingRAMCopy &copy : pendingRAMCopies) {
++            Framebuffer *fb = framebufferManager.find(copy.address);
++            auto imageIt = pendingRAMImages.find(copy.address);
++            if ((fb == nullptr) || (imageIt == pendingRAMImages.end()) || (fb->nativeTarget.writeBufferHistoryIndex >= fb->nativeTarget.writeBufferHistoryCount)) {
++                continue;
++            }
++
++            PendingRAMImage &image = imageIt->second;
++            uint32_t *ramWords = reinterpret_cast<uint32_t *>(&RDRAM[image.start]);
++            if (!image.checked) {
++                image.checked = true;
++                image.cpuWrote = (memcmp(ramWords, image.words.data(), image.words.size() * 4) != 0);
++                if (image.cpuWrote) {
++                    reportCpuWrite(copy.address, false);
++                }
++            }
++
++            if (image.cpuWrote) {
++                fb->nativeTarget.writeBufferHistoryIndex++;
++                continue;
++            }
++
++            landedWords = image.words;
++            fb->copyNativeToRAM(reinterpret_cast<uint8_t *>(landedWords.data()) + (fb->addressStart - image.start), copy.rowWidth, copy.rowStart, copy.rowEnd);
++            for (size_t i = 0; i < landedWords.size(); i++) {
++                if (landedWords[i] == image.words[i]) {
++                    continue;
++                }
++
++                if (!replaceRDRAMWord(&ramWords[i], image.words[i], landedWords[i])) {
++                    image.cpuWrote = true;
++                    reportCpuWrite(copy.address, true);
++                    break;
++                }
++
++                image.words[i] = landedWords[i];
++            }
++        }
++
++        // A framebuffer whose copies all landed holds them, which a later write by the CPU changes. One the CPU wrote to
++        // keeps its hash from the end of the list, so the next list reads it back.
++        for (const auto &it : pendingRAMImages) {
++            Framebuffer *fb = framebufferManager.find(it.first);
++            if ((fb != nullptr) && it.second.checked && !it.second.cpuWrote) {
++                fb->RAMHash = XXH3_64bits(reinterpret_cast<const uint8_t *>(it.second.words.data()) + (it.first - it.second.start), fb->RAMBytes);
++            }
++        }
++
++        pendingRAMCopies.clear();
++        pendingRAMImages.clear();
++    }
++
+     void State::listProcessBegin() {
+         dlCpuProfiler.start();
+     }
+@@ -849,6 +973,7 @@ namespace RT64 {
+     }
+ 
+     void State::fullSync() {
++        landRAMCopies(false);
+         flush();
+         submitFramebufferPair(FramebufferPair::FlushReason::ProcessDisplayListsEnd);
+ 
+@@ -868,6 +993,7 @@ namespace RT64 {
+         // Copy the current state's extended parameters into the workload.
+         workload.extended.ditherNoiseStrength = extended.ditherNoiseStrength;
+         workload.extended.texcoordWrapPoint = extended.texcoordWrapPoint;
++        workload.extended.pipelineWarmUp = extended.pipelineWarmUp;
+ 
+         auto emitTileWarning = [&](CommandWarning warning, size_t tileIndex) {
+             warning.indexType = CommandWarning::IndexType::TileIndex;
+@@ -1162,7 +1288,8 @@ namespace RT64 {
+ 
+                     // Submit the shader to the cache so compilation can start right away.
+                     // Ignore any calls that use fill type, as they're emulated without using a shader.
+-                    if (callDesc.otherMode.cycleType() != G_CYC_FILL) {
++                    // A pipeline warm-up's draw is the game's no more than its shader is (warmUpPipelines()).
++                    if ((callDesc.otherMode.cycleType() != G_CYC_FILL) && !extended.pipelineWarmUp) {
+                         ext.rasterShaderCache->submit(shaderDesc);
+                     }
+ 
+@@ -1313,6 +1440,10 @@ namespace RT64 {
+                             resizedTargets.emplace(colorDepthPair.second);
+                         }
+                     }
++
++#               if RT64_WGSL
++                    RenderTarget::matchColorToDepthTargets(ext.framebufferGraphicsWorker, colorDepthPairs, resizedTargets);
++#               endif
+                 }
+ 
+                 for (RenderTarget *renderTarget : resizedTargets) {
+@@ -1323,6 +1454,9 @@ namespace RT64 {
+             };
+ 
+             auto renderAndSynchronize = [&](uint32_t maxFramebufferPair) {
++                // The last batch's copies to RAM can wait for the next list (renderToRAMLate): nothing in this one reads them.
++                const bool copyLate = ext.emulatorConfig->framebuffer.renderToRAMLate && (maxFramebufferPair == workload.fbPairCount);
++
+                 // Preprocess all the framebuffer operations.
+                 uint32_t pairCursor = framebufferPairCursor;
+                 while (pairCursor < maxFramebufferPair) {
+@@ -1417,7 +1551,7 @@ namespace RT64 {
+                 }
+ 
+                 // Record all setup previous to drawing any of the recorded framebuffers.
+-                framebufferRenderer->endFramebuffers(ext.framebufferGraphicsWorker, &workload.drawBuffers, &workload.outputBuffers, false);
++                framebufferRenderer->endFramebuffers(ext.framebufferGraphicsWorker, &workload.drawBuffers, &workload.outputBuffers, workload.drawData.gpuTiles, workload.drawData.rdpTiles, false);
+                 framebufferRenderer->recordSetup(ext.framebufferGraphicsWorker, bufferUploaders, queuedProcessor, nullptr, &workload.outputBuffers, false);
+ 
+                 // Record the command list for the framebuffer pairs.
+@@ -1545,12 +1679,23 @@ namespace RT64 {
+                 ext.framebufferGraphicsWorker->commandList->end();
+                 framebufferRenderer->waitForUploaders();
+                 ext.framebufferGraphicsWorker->execute();
+-                ext.framebufferGraphicsWorker->wait();
++                if (!copyLate) {
++                    ext.framebufferGraphicsWorker->wait();
++                }
++
++                auto copyToRAM = [&](Framebuffer *fb, uint32_t rowWidth, uint32_t rowStart, uint32_t rowEnd) {
++                    if (copyLate) {
++                        addPendingRAMCopy(fb, rowWidth, rowStart, rowEnd);
++                    }
++                    else {
++                        fb->copyNativeToRAM(&RDRAM[fb->addressStart], rowWidth, rowStart, rowEnd);
++                    }
++                };
+ 
+                 pairCursor = framebufferPairCursor;
+                 while (pairCursor < maxFramebufferPair) {
+                     if (getFramebufferPairs(pairCursor)) {
+-                        colorFb->copyNativeToRAM(&RDRAM[colorFb->addressStart], colorWriteWidth, colorRowStart, std::min(colorRowEnd, colorFb->height));
++                        copyToRAM(colorFb, colorWriteWidth, colorRowStart, std::min(colorRowEnd, colorFb->height));
+ 
+                         // Pokemon Snap port: these rows are what the game's
+                         // CPU halves into a photo sprite; note what that
+@@ -1562,7 +1707,7 @@ namespace RT64 {
+                         }
+ 
+                         if (depthWriteWidth > 0) {
+-                            depthFb->copyNativeToRAM(&RDRAM[depthFb->addressStart], depthWriteWidth, depthRowStart, std::min(depthRowEnd, depthFb->height));
++                            copyToRAM(depthFb, depthWriteWidth, depthRowStart, std::min(depthRowEnd, depthFb->height));
+                         }
+                     }
+ 
+@@ -1954,6 +2099,10 @@ namespace RT64 {
+     }
+     
+     void State::updateScreen(const VI &newVI, bool fromEarlyPresent) {
++        // A frame copied to RAM a list late (renderToRAMLate) lands at the first VI after the GPU has finished it, or when
++        // the next list starts if that comes first.
++        landRAMCopies(true);
++
+         // If the debugger has paused the plugin, keep submitting the last workload and screen VI for rendering and a present event.
+         if (debuggerInspector.paused && !fromEarlyPresent) {
+             if (ext.userConfig->developerMode) {
+@@ -2027,6 +2176,7 @@ namespace RT64 {
+                     const uint8_t *fbRAM = &RDRAM[screenFb->addressStart];
+                     uint64_t currentHash = XXH3_64bits(fbRAM, screenFb->RAMBytes);
+                     if (currentHash != screenFb->RAMHash) {
++                        landRAMCopies(false);
+                         {
+                             RenderWorkerExecution workerExecution(worker);
+                             thread_local std::vector<uint32_t> fbDiscards;
+@@ -2784,6 +2934,27 @@ namespace RT64 {
+         workload.debuggerCamera = debuggerInspector.camera;
+         workload.debuggerRenderer = debuggerInspector.renderer;
+         workload.paused = paused;
++
++        // Whether the workload draws to any framebuffer the VI has shown lately, for a workload a full sync ends. It's
++        // worked out here, not where fullSync() ends, which the games' own patches of RT64 add to.
++        if (!paused) {
++            bool viShowsAny = false;
++            bool drawsShown = false;
++            for (const VIHistory::Present &entry : viHistory.history) {
++                if (!entry.vi.visible()) {
++                    continue;
++                }
++
++                viShowsAny = true;
++                for (uint32_t f = 0; (f < workload.fbPairCount) && !drawsShown; f++) {
++                    const FramebufferPair &fbPair = workload.fbPairs[f];
++                    drawsShown = !fbPair.drawColorRect.isEmpty() && (fbPair.colorImage.address == entry.vi.fbAddress()) &&
++                        (fbPair.colorImage.width == entry.vi.fbSize().x) && (fbPair.colorImage.siz == entry.vi.fbSiz());
++                }
++            }
++
++            workload.offscreenOnly = viShowsAny && (workload.fbPairCount > 0) && !drawsShown;
++        }
+     }
+ 
+     void State::advancePresent(Present &present, bool paused) {
+@@ -2898,6 +3069,25 @@ namespace RT64 {
+         ext.workloadQueue->workloads[ext.workloadQueue->writeCursor].snapCutHold = true;
+     }
+ 
++    // A list that draws a rect with the ubershader through the renderer, but none of its triangles (drawsNothing), and
++    // copies nothing to RAM: on WebGPU the draw of nothing resolves the layout of the sets the renderer draws with, which
++    // starts the pipelines made for it in the background (plume's WebGPUGraphicsPipeline), where the device builds them
++    // there. Done at setup, the ubershader's pipelines (one per depth and coverage state) are built behind the launcher;
++    // otherwise the game's first frame resolved the layout and built each state it drew in line, which in Chrome held the
++    // page's presents for as long (1.4-2.0 s for Banjo's four). The prebuilt list's pipelines wait for that layout too,
++    // so they build behind the launcher as well. Its draw asks the shader cache for no shader (fullSync()).
++    void State::warmUpPipelines() {
++        listProcessBegin();
++        rdp->setColorImage(G_IM_FMT_RGBA, G_IM_SIZ_16b, 320, 0x700000);
++        rdp->setOtherMode(G_CYC_1CYCLE, 0);
++        rdp->setScissor(0, 0, 0, 320 << 2, 240 << 2);
++        rdp->fillRect(0, 0, 16 << 2, 16 << 2);
++        setRenderToRAM(0);
++        extended.pipelineWarmUp = true;
++        fullSync();
++        listProcessEnd();
++    }
++
+     void State::setDitherNoiseStrength(float noiseStrength) {
+         extended.ditherNoiseStrength = noiseStrength;
+     }
+diff --git b/src/hle/rt64_state.h a/src/hle/rt64_state.h
+index 37d0568..95ccd69 100644
+--- b/src/hle/rt64_state.h
++++ a/src/hle/rt64_state.h
+@@ -103,6 +103,28 @@ namespace RT64 {
+         std::vector<uint32_t> drawFbDiscards;
+         std::vector<DisplayList *> returnAddressStack;
+         std::vector<Framebuffer *> differentFbs;
++
++        // Render to RAM copies waiting for the next list or screen update (renderToRAMLate), in the order they were drawn.
++        struct PendingRAMCopy {
++            uint32_t address;
++            uint32_t rowWidth;
++            uint32_t rowStart;
++            uint32_t rowEnd;
++        };
++
++        // For each framebuffer with a pending copy, by its address: the words of RDRAM it covers (from a word-aligned
++        // start) as they were when the list ended, with each copy written in as it lands, and whether the CPU has
++        // written to them since.
++        struct PendingRAMImage {
++            uint32_t start = 0;
++            std::vector<uint32_t> words;
++            bool checked = false;
++            bool cpuWrote = false;
++        };
++
++        std::vector<PendingRAMCopy> pendingRAMCopies;
++        std::unordered_map<uint32_t, PendingRAMImage> pendingRAMImages;
++        uint32_t lateRAMCopyCpuWrites = 0;
+         GameConfiguration gameConfig;
+         uint32_t displayListAddress;
+         uint64_t displayListCounter;
+@@ -145,6 +167,7 @@ namespace RT64 {
+             // stands in this display list, for an element drawn more than
+             // once in it (snapRectGroupCommand).
+             std::unordered_map<uint32_t, uint32_t> snapRectNext;
++            bool pipelineWarmUp = false;
+         };
+ 
+         Extended extended;
+@@ -160,6 +183,8 @@ namespace RT64 {
+         void flush();
+         void submitFramebufferPair(FramebufferPair::FlushReason flushReason);
+         void checkRDRAM();
++        void addPendingRAMCopy(Framebuffer *fb, uint32_t rowWidth, uint32_t rowStart, uint32_t rowEnd);
++        void landRAMCopies(bool onlyIfReady);
+         void fullSync();
+         void fullSyncFramebufferPairTiles(Workload &workload, FramebufferPair &fbPair, uint32_t &loadOpCursor, uint32_t &rdpTileCursor);
+         void listProcessBegin();
+@@ -181,6 +206,7 @@ namespace RT64 {
+         void snapCutHoldCommand();
+         void snapAuthoredStepCommand(uint32_t id);
+         void snapRectGroupCommand(uint32_t id, bool single);
++        void warmUpPipelines();
+         void setDitherNoiseStrength(float noiseStrength);
+         void setExtendedRDRAM(bool isExtended);
+         void setTexcoordWrapPoint(int16_t wrapU, int16_t wrapV);
+diff --git b/src/hle/rt64_vi.cpp a/src/hle/rt64_vi.cpp
+index 7e2f00e..6b0cb1b 100644
+--- b/src/hle/rt64_vi.cpp
++++ a/src/hle/rt64_vi.cpp
+@@ -162,32 +162,41 @@ namespace RT64 {
+     }
+ 
+     uint32_t VIHistory::logicalRateFromFactors() {
++        const uint32_t FullRate = 60; // TODO: PAL support.
+         if ((factors[0] != 0) && std::all_of(factors.begin(), factors.end(), [&](uint32_t factor) { return factor == factors[0]; })) {
+-            const uint32_t FullRate = 60; // TODO: PAL support.
+             lastLogicalRate = FullRate / factors[0];
+             return lastLogicalRate;
+         }
+-        else {
+-            // Pokemon Snap port: a run of frames that did not all take the same
+-            // number of refreshes means this measurement cannot say what the
+-            // rate is -- not that the game has no rate. Answering zero is taken
+-            // downstream as "slower than any display", which switches
+-            // interpolation off for that frame, and one game frame without
+-            // interpolation is one game frame in which the picture cannot
+-            // change at all: a hard hitch, measured at a third of a second's
+-            // worth of stillness every time it happens.
+-            //
+-            // This game wobbles for exactly the reasons that matter most. Its
+-            // scheduler drops a frame when the scene gets heavy, which is what
+-            // happens while the camera sweeps new scenery into view, so the
+-            // hitch landed precisely on the turns it was supposed to smooth.
+-            // A game's logical rate does not change from one frame to the next;
+-            // a mixed history is a gap in the measurement, so the last rate
+-            // actually measured is carried across it. A genuine rate change
+-            // settles into a new run of matching factors within a few frames
+-            // and is picked up then.
+-            return lastLogicalRate;
++#   if RT64_UNEVEN_FRAME_RATES
++        // With RT64_UNEVEN_FRAME_RATES frames that took an uneven number of VIs (a game at 30 dropping to 20 when a frame
++        // runs long, or VIs that come unevenly) are interpolated at the fastest of them, not left uninterpolated: a frame
++        // that comes later holds the last interpolated frame until it does, and none is cut short by the next. Only while
++        // the slowest took at most twice the VIs of the fastest, so a load's frame of dozens of VIs leaves its frames
++        // uninterpolated as before: RT64 keeps a color target for every display frame of a game frame.
++        const auto range = std::minmax_element(factors.begin(), factors.end());
++        if ((*range.first != 0) && (*range.second <= (*range.first * 2))) {
++            return FullRate / *range.first;
+         }
++#   endif
++        // Pokemon Snap port: a run of frames that did not all take the same
++        // number of refreshes means this measurement cannot say what the
++        // rate is -- not that the game has no rate. Answering zero is taken
++        // downstream as "slower than any display", which switches
++        // interpolation off for that frame, and one game frame without
++        // interpolation is one game frame in which the picture cannot
++        // change at all: a hard hitch, measured at a third of a second's
++        // worth of stillness every time it happens.
++        //
++        // This game wobbles for exactly the reasons that matter most. Its
++        // scheduler drops a frame when the scene gets heavy, which is what
++        // happens while the camera sweeps new scenery into view, so the
++        // hitch landed precisely on the turns it was supposed to smooth.
++        // A game's logical rate does not change from one frame to the next;
++        // a mixed history is a gap in the measurement, so the last rate
++        // actually measured is carried across it. A genuine rate change
++        // settles into a new run of matching factors within a few frames
++        // and is picked up then.
++        return lastLogicalRate;
+     }
+ 
+     const VIHistory::Present &VIHistory::top() const {
+diff --git b/src/hle/rt64_workload_queue.cpp a/src/hle/rt64_workload_queue.cpp
+index adf6006..4192d6e 100644
+--- b/src/hle/rt64_workload_queue.cpp
++++ a/src/hle/rt64_workload_queue.cpp
+@@ -125,7 +125,11 @@ namespace RT64 {
+ 
+         threadsRunning = true;
+         renderThread = new std::thread(&WorkloadQueue::renderThreadLoop, this);
++#ifndef __EMSCRIPTEN__
++        // Not in a browser: it keeps a desktop driver from lowering the GPU's clock, which a page has no say in, and every
++        // dispatch would be a trip to the thread that owns the WebGPU device.
+         idleThread = new std::thread(&WorkloadQueue::idleThreadLoop, this);
++#endif
+     }
+ 
+     void WorkloadQueue::updateMultisampling() {
+@@ -270,6 +274,12 @@ namespace RT64 {
+         // Store the rate that was chosen for the configuration.
+         ext.sharedResources->targetRate = workloadConfig.targetRate;
+ 
++        // A lower rate the present queue paces the frames to while the GPU can't keep up with this one (PresentQueue::pace()).
++        const uint32_t pacedRate = ext.sharedResources->pacedRate;
++        if ((pacedRate > 0) && (pacedRate < workloadConfig.targetRate)) {
++            workloadConfig.targetRate = pacedRate;
++        }
++
+ #   if RT_ENABLED
+         workloadConfig.raytracingEnabled = rtEnabled;
+ 
+@@ -767,6 +777,10 @@ namespace RT64 {
+                 }
+             }
+ 
++#       if RT64_WGSL
++            RenderTarget::matchColorToDepthTargets(ext.workloadGraphicsWorker, colorDepthPairs, resizedTargets);
++#       endif
++
+             for (RenderTarget *renderTarget : resizedTargets) {
+                 renderFramebufferManager->destroyAllWithRenderTarget(renderTarget);
+             }
+@@ -856,7 +870,8 @@ namespace RT64 {
+                     drawParams.rtEnabled = workloadConfig.raytracingEnabled;
+                     drawParams.submissionFrame = workload.submissionFrame;
+                     drawParams.deltaTimeMs = deltaTimeMs;
+-                    drawParams.ubershadersOnly = ubershadersOnly;
++                    drawParams.ubershadersOnly = ubershadersOnly || workload.extended.pipelineWarmUp;
++                    drawParams.drawsNothing = workload.extended.pipelineWarmUp;
+                     drawParams.postBlendNoise = workloadConfig.postBlendNoise;
+                     drawParams.postBlendNoiseNegative = workloadConfig.postBlendNoiseNegative;
+                     drawParams.maxGameCall = std::min(gameCallCountMax - gameCallCursor, fbPair.gameCallCount);
+@@ -953,7 +968,7 @@ namespace RT64 {
+             }
+             ext.workloadGraphicsWorker->commandList->resetQueryPool(queryPool.get(), 0, 2);
+             ext.workloadGraphicsWorker->commandList->writeTimestamp(queryPool.get(), 0);
+-            framebufferRenderer->endFramebuffers(ext.workloadGraphicsWorker, &workload.drawBuffers, &workload.outputBuffers, workloadConfig.raytracingEnabled);
++            framebufferRenderer->endFramebuffers(ext.workloadGraphicsWorker, &workload.drawBuffers, &workload.outputBuffers, workload.drawData.gpuTiles, workload.drawData.rdpTiles, workloadConfig.raytracingEnabled);
+             framebufferRenderer->recordSetup(ext.workloadGraphicsWorker, bufferUploaders, processRSP ? rspProcessor.get() : nullptr, processWorldVertices ? vertexProcessor.get() : nullptr, &workload.outputBuffers, workloadConfig.raytracingEnabled);
+             
+             // Record all framebuffer pairs.
+@@ -1190,6 +1205,9 @@ namespace RT64 {
+         // How many interpolated targets the last shown frame filled; its final
+         // one is the last picture the screen actually displayed.
+         uint32_t snapPrevInterpolatedIndex = 0;
++        GameFrame offscreenFrame;
++        bool lastWorkloadOffscreen = false;
++        bool barrierHeld = false;
+         while (threadsRunning) {
+             {
+                 std::unique_lock<std::mutex> cursorLock(cursorMutex);
+@@ -1204,6 +1222,12 @@ namespace RT64 {
+             }
+ 
+             if (processCursor >= 0) {
++                // The game waits for the prebuilt shaders (RasterShaderCache::startPrebuild()) here, past its first frame.
++                // The present queue counts the waits, to leave the burst of presents after one out of its pacing.
++                if (ext.rasterShaderCache->waitForPrebuild()) {
++                    ext.sharedResources->prebuildWaits++;
++                }
++
+                 std::unique_lock<std::mutex> threadLock(threadMutex);
+                 Workload &workload = workloads[processCursor];
+                 ext.presentQueue->waitForPresentId(workload.presentId);
+@@ -1216,22 +1240,36 @@ namespace RT64 {
+                 workloadProfiler.start();
+                 threadConfigurationUpdate(workload.viFbSize, workloadConfig);
+ 
++                // With RT64_OFFSCREEN_WORKLOADS a workload that draws only offscreen (Workload::offscreenOnly) is a pass of the
++                // game frame the next workload draws, as when a game draws its shadows' render targets in a display list of
++                // their own before the frame's. It's drawn, but it isn't a frame: the next one is matched against the frame
++                // before it, and the present's framebuffers and interpolated frames stay that frame's. Otherwise each workload
++                // is a frame, and the frame after such a pass matched nothing and was never interpolated. One pass at most
++                // between two frames: the frame before stays out of the writer's reach until the next frame is drawn (the
++                // barrier), and the queue holds two more workloads for it (WORKLOAD_QUEUE_SIZE).
++#           if RT64_OFFSCREEN_WORKLOADS
++                const bool offscreenPass = workload.offscreenOnly && !workload.paused && !lastWorkloadOffscreen && !gameFrames[curFrameIndex].workloads.empty();
++#           else
++                const bool offscreenPass = false;
++#           endif
++                lastWorkloadOffscreen = offscreenPass;
++
+                 // FIXME: This is a very hacky way to find out if we need to advance the frame if the workload was paused for the first time.
+-                if (!workload.paused || (!gameFrames[curFrameIndex].workloads.empty() && (gameFrames[curFrameIndex].workloads[0] != (uint32_t)processCursor))) {
++                if (!offscreenPass && (!workload.paused || (!gameFrames[curFrameIndex].workloads.empty() && (gameFrames[curFrameIndex].workloads[0] != (uint32_t)processCursor)))) {
+                     prevFrameIndex = curFrameIndex;
+                     curFrameIndex = (curFrameIndex + 1) % gameFrames.size();
+                 }
+                 
+                 // TODO: The frame detection needs to be more elaborate than just matching one workload to one frame.
+-                GameFrame &curFrame = gameFrames[curFrameIndex];
+-                const GameFrame &prevFrame = gameFrames[prevFrameIndex];
++                GameFrame &curFrame = offscreenPass ? offscreenFrame : gameFrames[curFrameIndex];
++                const GameFrame &prevFrame = offscreenPass ? offscreenFrame : gameFrames[prevFrameIndex];
+                 uint32_t workloadIndex = processCursor;
+                 curFrame.set(*this, &workloadIndex, 1);
+ 
+                 // Detect the color image to interpolate for this workload.
+                 RenderTargetKey interpolationTargetKey;
+                 int32_t interpolationTargetFbPairIndex = -1;
+-                {
++                if (!offscreenPass) {
+                     std::scoped_lock<std::mutex> managerLock(ext.sharedResources->managerMutex);
+                     FramebufferManager &fbManager = ext.sharedResources->framebufferManager;
+                     std::vector<uint32_t> &colorVector = ext.sharedResources->colorImageAddressVector;
+@@ -1275,7 +1313,7 @@ namespace RT64 {
+                 float prevFrameWeight = 0.0f;
+                 float curFrameWeight = 1.0f;
+                 float deltaTimeMs = 1.0f / 30.0f;
+-                const bool requiresFrameMatching = (workloadConfig.targetRate > 0) || workloadConfig.raytracingEnabled;
++                const bool requiresFrameMatching = !offscreenPass && ((workloadConfig.targetRate > 0) || workloadConfig.raytracingEnabled);
+                 bool generateInterpolatedFrames = false;
+                 bool velocityUploaderUsed = false;
+                 bool tileInterpolationUsed = false;
+@@ -1572,7 +1610,7 @@ namespace RT64 {
+                 
+                 // Get the current and previous set of frame counters. The other set can be in use by the present queue. Skip if no new present event has arrived before this workload event.
+                 InterpolatedFrameCounters &prevFrameCounters = ext.sharedResources->interpolatedFrames[ext.sharedResources->interpolatedFramesIndex];
+-                const bool useDifferentCounters = (lastPresentId != workload.presentId);
++                const bool useDifferentCounters = !offscreenPass && (lastPresentId != workload.presentId);
+                 if (useDifferentCounters) {
+                     ext.sharedResources->interpolatedFramesIndex = ext.sharedResources->interpolatedFramesIndex ^ 1;
+                     lastPresentId = workload.presentId;
+@@ -1587,11 +1625,13 @@ namespace RT64 {
+                 }
+ 
+                 InterpolatedFrameCounters &curFrameCounters = ext.sharedResources->interpolatedFrames[ext.sharedResources->interpolatedFramesIndex];
+-                curFrameCounters.skipped = false;
+-                curFrameCounters.presented = 0;
+-                curFrameCounters.available = 0;
+-                curFrameCounters.count = displayFrames;
+-                curFrameCounters.snapFirstFromInterpolated = false;
++                if (!offscreenPass) {
++                    curFrameCounters.skipped = false;
++                    curFrameCounters.presented = 0;
++                    curFrameCounters.available = 0;
++                    curFrameCounters.count = displayFrames;
++                    curFrameCounters.snapFirstFromInterpolated = false;
++                }
+ 
+                 // Create as many render targets as required to store the interpolated targets.
+                 auto &interpolatedTargets = ext.sharedResources->interpolatedColorTargets;
+@@ -1606,6 +1646,14 @@ namespace RT64 {
+                 if (usingMSAA && !interpolationTargetKey.isEmpty()) {
+                     requiredFrames = std::max(requiredFrames, 1u);
+                 }
++#           if defined(__EMSCRIPTEN__)
++                // At most InterpolatedTargetSlots targets, used in turn: a frame past them waits for the frame drawn into its
++                // target to be presented. RT64 keeps a target for every display frame of a game frame and never frees one,
++                // so a page held as many as the slowest game frame of the visit took display frames: GoldenEye's targets
++                // are 5702x2970 (68 MB) at a 3840x2000 canvas, and ?uncapped (360 Hz) in Dam at ~8 fps kept 42 of them,
++                // 2.8 GB, until Firefox's device ran out of memory. At 60 Hz a game frame takes more only below 7.5 fps.
++                requiredFrames = std::min(requiredFrames, InterpolatedTargetSlots);
++#           endif
+                 if ((requiredFrames > 0) && (interpolatedTargets.size() < requiredFrames)) {
+                     // Pokemon Snap port: the present thread indexes this same
+                     // vector while showing the frames of the tick before this
+@@ -1837,6 +1885,15 @@ namespace RT64 {
+                 bool skipWorkloadNow = false;
+                 uint32_t targetIndex = 0;
+                 uint32_t framesRendered = 0;
++                auto newerWorkloadQueued = [&]() {
++                    std::scoped_lock<std::mutex> cursorLock(cursorMutex);
++                    bool newer = (writeCursor != threadCursor);
++#               if RT64_OFFSCREEN_WORKLOADS
++                    // An offscreen pass alone is the start of the next frame, not the frame: these frames go on.
++                    newer = newer && !(workloads[threadCursor].offscreenOnly && (int((threadCursor + 1) % workloads.size()) == writeCursor));
++#               endif
++                    return newer;
++                };
+                 int64_t renderTimeTotalMicro = 0;
+                 // Pokemon Snap port: whether this tick's held picture was
+                 // delivered into interpolated target 0 while the tick itself
+@@ -1896,15 +1953,43 @@ namespace RT64 {
+ 
+                         // Override the render target.
+                         if (usingMSAA || (frame > 0)) {
+-                            overrideTarget = interpolatedTargets[targetIndex].get();
+-                            overrideModifier = (targetIndex + 1);
++                            // The targets are used in turn when there are fewer than the frames (InterpolatedTargetSlots).
++                            const uint32_t targetSlots = uint32_t(interpolatedTargets.size());
++                            const uint32_t targetSlot = targetIndex % targetSlots;
++                            overrideTarget = interpolatedTargets[targetSlot].get();
++                            overrideModifier = (targetSlot + 1);
++
++#                       if defined(__EMSCRIPTEN__)
++                            if (targetIndex >= targetSlots) {
++                                // Wait until this workload's own frame drawn into the target has been presented, unless a newer
++                                // workload is waiting: then the rest of this one's frames are skipped, as they are after a frame.
++                                std::unique_lock<std::mutex> interpolatedLock(ext.sharedResources->interpolatedMutex);
++                                while ((curFrameCounters.presented <= (targetIndex - targetSlots)) && !skipWorkloadNow) {
++                                    ext.sharedResources->interpolatedCondition.wait_for(interpolatedLock, std::chrono::milliseconds(5));
++                                    if (curFrameCounters.presented <= (targetIndex - targetSlots)) {
++                                        interpolatedLock.unlock();
++                                        skipWorkloadNow = newerWorkloadQueued();
++                                        interpolatedLock.lock();
++                                    }
++                                }
++
++                                if (skipWorkloadNow) {
++                                    curFrameCounters.skipped = true;
++                                    interpolatedLock.unlock();
++                                    displayTicks += workload.viOriginalRate * (displayFrames - (frame + 1));
++                                    ext.sharedResources->interpolatedCondition.notify_all();
++                                    continue;
++                                }
++                            }
++#                       endif
+ 
+-                            if (useDifferentCounters && (prevFrameCounters.available > 0) && (targetIndex < prevFrameCounters.available)) {
++                            if (useDifferentCounters && (prevFrameCounters.available > targetSlot)) {
+                                 // Wait until the target has finished presenting if the alternate frame counter (used by the present queue) is making use of this target.
++                                const uint32_t prevTargetIndex = targetSlot + ((prevFrameCounters.available - 1 - targetSlot) / targetSlots) * targetSlots;
+                                 std::unique_lock<std::mutex> interpolatedLock(ext.sharedResources->interpolatedMutex);
+                                 ext.sharedResources->interpolatedCondition.wait(interpolatedLock, [&]() {
+-                                    frameReduction = frameReduction || (prevFrameCounters.presented <= targetIndex);
+-                                    return prevFrameCounters.presented > targetIndex;
++                                    frameReduction = frameReduction || (prevFrameCounters.presented <= prevTargetIndex);
++                                    return prevFrameCounters.presented > prevTargetIndex;
+                                 });
+                             }
+ 
+@@ -2053,10 +2138,7 @@ namespace RT64 {
+ 
+                     // For every additional frame, we increase the frames available and notify the present queue.
+                     if (generateInterpolatedFrames && (usingMSAA || (frame > 0))) {
+-                        {
+-                            std::scoped_lock<std::mutex> cursorLock(cursorMutex);
+-                            skipWorkloadNow = ((frame + 1) < displayFrames) && (writeCursor != threadCursor);
+-                        }
++                        skipWorkloadNow = ((frame + 1) < displayFrames) && newerWorkloadQueued();
+ 
+                         {
+                             std::scoped_lock<std::mutex> managerLock(ext.sharedResources->interpolatedMutex);
+@@ -2093,7 +2175,7 @@ namespace RT64 {
+                 // does not become the hold source itself -- its target shows
+                 // the previous image, which is exactly what a second
+                 // consecutive transit should keep showing.
+-                if (!workload.paused && !interpolationTargetKey.isEmpty()) {
++                if (!offscreenPass && !workload.paused && !interpolationTargetKey.isEmpty()) {
+                     snapPrevTargetKey = interpolationTargetKey;
+                     // How many interpolated targets this frame filled, so a
+                     // hold on the next one can take the last picture shown
+@@ -2112,7 +2194,16 @@ namespace RT64 {
+                     }
+                 }
+ 
+-                if (!workload.paused) {
++                // The barrier stays on the frame before an offscreen pass, and catches up once the next frame is drawn.
++                if (offscreenPass) {
++                    barrierHeld = true;
++                }
++                else if (!workload.paused) {
++                    if (barrierHeld) {
++                        threadAdvanceBarrier();
++                        barrierHeld = false;
++                    }
++
+                     threadAdvanceBarrier();
+                 }
+ 
+diff --git b/src/render/rt64_raster_shader.cpp a/src/render/rt64_raster_shader.cpp
+index aea4d39..61730b4 100644
+--- b/src/render/rt64_raster_shader.cpp
++++ a/src/render/rt64_raster_shader.cpp
+@@ -7,18 +7,46 @@
+ #include "xxHash/xxh3.h"
+ 
+ #include "shaders/RenderParams.hlsli.rw.h"
+-#include "shaders/RasterPSDynamic.hlsl.spirv.h"
+-#include "shaders/RasterPSDynamicMS.hlsl.spirv.h"
+-#include "shaders/RasterPSSpecConstant.hlsl.spirv.h"
+-#include "shaders/RasterPSSpecConstantMS.hlsl.spirv.h"
+-#include "shaders/RasterPSSpecConstantFlat.hlsl.spirv.h"
+-#include "shaders/RasterPSSpecConstantFlatMS.hlsl.spirv.h"
+-#include "shaders/RasterVSDynamic.hlsl.spirv.h"
+-#include "shaders/RasterVSSpecConstant.hlsl.spirv.h"
+-#include "shaders/RasterVSSpecConstantFlat.hlsl.spirv.h"
+-#include "shaders/PostBlendDitherNoiseAddPS.hlsl.spirv.h"
+-#include "shaders/PostBlendDitherNoiseSubPS.hlsl.spirv.h"
+-#include "shaders/PostBlendDitherNoiseSubNegativePS.hlsl.spirv.h"
++#if defined(RT64_WGSL)
++#   include "shaders/RasterPSDynamic.hlsl.wgsl.h"
++#   include "shaders/RasterPSDynamicMS.hlsl.wgsl.h"
++#   include "shaders/RasterPSSpecConstantFlatLoops.hlsl.wgsl.h"
++#   include "shaders/RasterPSSpecConstantFlatLoopsMS.hlsl.wgsl.h"
++#   include "shaders/RasterVSDynamic.hlsl.wgsl.h"
++#   include "shaders/RasterVSSpecConstantFlat.hlsl.wgsl.h"
++#   include "shaders/PostBlendDitherNoiseAddPS.hlsl.wgsl.h"
++#   include "shaders/PostBlendDitherNoiseSubPS.hlsl.wgsl.h"
++#   include "shaders/PostBlendDitherNoiseSubNegativePS.hlsl.wgsl.h"
++#   include "shaders/RasterPSDynamicDualSource.hlsl.wgsl.h"
++#   include "shaders/RasterPSDynamicMSDualSource.hlsl.wgsl.h"
++#   include "shaders/RasterPSSpecConstantFlatLoopsDualSource.hlsl.wgsl.h"
++#   include "shaders/RasterPSSpecConstantFlatLoopsMSDualSource.hlsl.wgsl.h"
++#else
++#   include "shaders/RasterPSDynamic.hlsl.spirv.h"
++#   include "shaders/RasterPSDynamicMS.hlsl.spirv.h"
++#   include "shaders/RasterPSSpecConstant.hlsl.spirv.h"
++#   include "shaders/RasterPSSpecConstantMS.hlsl.spirv.h"
++#   include "shaders/RasterPSSpecConstantFlat.hlsl.spirv.h"
++#   include "shaders/RasterPSSpecConstantFlatMS.hlsl.spirv.h"
++#   include "shaders/RasterVSDynamic.hlsl.spirv.h"
++#   include "shaders/RasterVSSpecConstant.hlsl.spirv.h"
++#   include "shaders/RasterVSSpecConstantFlat.hlsl.spirv.h"
++#   include "shaders/PostBlendDitherNoiseAddPS.hlsl.spirv.h"
++#   include "shaders/PostBlendDitherNoiseSubPS.hlsl.spirv.h"
++#   include "shaders/PostBlendDitherNoiseSubNegativePS.hlsl.spirv.h"
++#   include "shaders/RasterPSDynamicPerDraw.hlsl.spirv.h"
++#   include "shaders/RasterPSDynamicMSPerDraw.hlsl.spirv.h"
++#   include "shaders/RasterPSSpecConstantPerDraw.hlsl.spirv.h"
++#   include "shaders/RasterPSSpecConstantMSPerDraw.hlsl.spirv.h"
++#   include "shaders/RasterPSSpecConstantFlatPerDraw.hlsl.spirv.h"
++#   include "shaders/RasterPSSpecConstantFlatMSPerDraw.hlsl.spirv.h"
++#   include "shaders/RasterVSDynamicPerDraw.hlsl.spirv.h"
++#   include "shaders/RasterVSSpecConstantPerDraw.hlsl.spirv.h"
++#   include "shaders/RasterVSSpecConstantFlatPerDraw.hlsl.spirv.h"
++#   include "shaders/PostBlendDitherNoiseAddPSPerDraw.hlsl.spirv.h"
++#   include "shaders/PostBlendDitherNoiseSubPSPerDraw.hlsl.spirv.h"
++#   include "shaders/PostBlendDitherNoiseSubNegativePSPerDraw.hlsl.spirv.h"
++#endif
+ #ifdef _WIN32
+ #   include "shaders/RasterPSLibrary.hlsl.dxil.h"
+ #   include "shaders/RasterPSLibraryMS.hlsl.dxil.h"
+@@ -67,19 +95,64 @@ namespace RT64 {
+ 
+     // OptimizerCacheSPIRV
+ 
+-    void OptimizerCacheSPIRV::initialize() {
+-        rasterVS.parse(RasterVSSpecConstantBlobSPIRV, std::size(RasterVSSpecConstantBlobSPIRV));
+-        rasterVSFlat.parse(RasterVSSpecConstantFlatBlobSPIRV, std::size(RasterVSSpecConstantFlatBlobSPIRV));
+-        rasterPS.parse(RasterPSSpecConstantBlobSPIRV, std::size(RasterPSSpecConstantBlobSPIRV));
+-        rasterPSMS.parse(RasterPSSpecConstantMSBlobSPIRV, std::size(RasterPSSpecConstantMSBlobSPIRV));
+-        rasterPSFlat.parse(RasterPSSpecConstantFlatBlobSPIRV, std::size(RasterPSSpecConstantFlatBlobSPIRV));
+-        rasterPSFlatMS.parse(RasterPSSpecConstantFlatMSBlobSPIRV, std::size(RasterPSSpecConstantFlatMSBlobSPIRV));
++    void OptimizerCacheSPIRV::initialize(const RenderDeviceCapabilities &capabilities) {
++#   if defined(RT64_WGSL)
++        assert(false && "A WGSL build has no SPIR-V shaders.");
++#   else
++        const auto parse = [](respv::Shader &shader, const SPIRVBlob &blob) {
++            shader.parse(blob.data, blob.size);
++        };
++
++        parse(rasterVS, RT64_TEXTURE_SETS_SPIRV(RasterVSSpecConstant, capabilities));
++        parse(rasterVSFlat, RT64_TEXTURE_SETS_SPIRV(RasterVSSpecConstantFlat, capabilities));
++        parse(rasterPS, RT64_TEXTURE_SETS_SPIRV(RasterPSSpecConstant, capabilities));
++        parse(rasterPSMS, RT64_TEXTURE_SETS_SPIRV(RasterPSSpecConstantMS, capabilities));
++        parse(rasterPSFlat, RT64_TEXTURE_SETS_SPIRV(RasterPSSpecConstantFlat, capabilities));
++        parse(rasterPSFlatMS, RT64_TEXTURE_SETS_SPIRV(RasterPSSpecConstantFlatMS, capabilities));
+         assert(!rasterVS.empty());
+         assert(!rasterVSFlat.empty());
+         assert(!rasterPS.empty());
+         assert(!rasterPSMS.empty());
+         assert(!rasterPSFlat.empty());
+         assert(!rasterPSFlatMS.empty());
++#   endif
++    }
++
++    // ShaderCacheWGSL
++
++    const RenderShader *ShaderCacheWGSL::get(RenderDevice *device, const void *blob, uint64_t size, const char *entryPointName) {
++        const std::unique_lock<std::mutex> lock(mutex);
++        std::unique_ptr<RenderShader> &shader = shaders[blob];
++        if (shader == nullptr) {
++            shader = device->createShader(blob, size, entryPointName, RenderShaderFormat::WGSL);
++        }
++
++        return shader.get();
++    }
++
++    void ShaderCacheWGSL::get(RenderDevice *device, bool useMSAA, const RenderShader *&vertexShader, const RenderShader *&pixelShader) {
++#   if defined(RT64_WGSL)
++        // Every shading mode draws with the flat ones: the mode is a spec constant too (rpFlagsValue), and a smooth
++        // shader never reads the flat color it is given (RasterPS() picks the smooth one), so the smooth pair would be
++        // the same shader again. Chrome parses each module on its GPU main thread, where every present waits behind it:
++        // the smooth RasterPS was ~0.9 s of the launcher's first frames (GoldenEye, Chrome 155, RTX 2070). RasterPS is the
++        // one with the ubershader's loops (CMakeLists.txt, SPEC_CONSTANT_LOOPS), and writes the blend factor to a second output only where the device has dual-source blending
++        // (RasterShader::createPipeline).
++        const bool dualSource = device->getCapabilities().dualSourceBlending;
++        vertexShader = get(device, RasterVSSpecConstantFlatBlobWGSL, sizeof(RasterVSSpecConstantFlatBlobWGSL), "VSMain");
++        if (useMSAA) {
++            pixelShader = dualSource ?
++                get(device, RasterPSSpecConstantFlatLoopsMSDualSourceBlobWGSL, sizeof(RasterPSSpecConstantFlatLoopsMSDualSourceBlobWGSL), "PSMain") :
++                get(device, RasterPSSpecConstantFlatLoopsMSBlobWGSL, sizeof(RasterPSSpecConstantFlatLoopsMSBlobWGSL), "PSMain");
++        }
++        else {
++            pixelShader = dualSource ?
++                get(device, RasterPSSpecConstantFlatLoopsDualSourceBlobWGSL, sizeof(RasterPSSpecConstantFlatLoopsDualSourceBlobWGSL), "PSMain") :
++                get(device, RasterPSSpecConstantFlatLoopsBlobWGSL, sizeof(RasterPSSpecConstantFlatLoopsBlobWGSL), "PSMain");
++        }
++#   else
++        assert(false && "This build has no WGSL shaders.");
++#   endif
+     }
+ 
+     // RasterShader
+@@ -125,7 +198,7 @@ namespace RT64 {
+ #endif
+ 
+     RasterShader::RasterShader(RenderDevice *device, const ShaderDescription &desc, const RenderPipelineLayout *pipelineLayout, RenderShaderFormat shaderFormat, const RenderMultisampling &multisampling, 
+-        const ShaderCompiler *shaderCompiler, const OptimizerCacheSPIRV *optimizerCacheSPIRV, ShaderBlobCache *blobCache)
++        const ShaderCompiler *shaderCompiler, const OptimizerCacheSPIRV *optimizerCacheSPIRV, ShaderCacheWGSL *shaderCacheWGSL, ShaderBlobCache *blobCache)
+     {
+         assert(device != nullptr);
+ 
+@@ -135,10 +208,25 @@ namespace RT64 {
+         const bool useMSAA = (multisampling.sampleCount > 1);
+         std::unique_ptr<RenderShader> vertexShader;
+         std::unique_ptr<RenderShader> pixelShader;
+-#ifdef __APPLE__
++        const RenderShader *sharedVertexShader = nullptr;
++        const RenderShader *sharedPixelShader = nullptr;
++#if defined(__APPLE__) || defined(RT64_WGSL)
+         std::vector<RenderSpecConstant> specConstants;
+ #endif
+-        if (shaderFormat == RenderShaderFormat::SPIRV) {
++        if (shaderFormat == RenderShaderFormat::WGSL) {
++#       if defined(RT64_WGSL)
++            // As Metal: the pre-compiled permutation, with the spec constants as the pipeline's override constants.
++            shaderCacheWGSL->get(device, useMSAA, sharedVertexShader, sharedPixelShader);
++            specConstants.emplace_back(0, desc.otherMode.L);
++            specConstants.emplace_back(1, desc.otherMode.H);
++            specConstants.emplace_back(2, desc.colorCombiner.L);
++            specConstants.emplace_back(3, desc.colorCombiner.H);
++            specConstants.emplace_back(4, desc.flags.value);
++#       else
++            assert(false && "This build has no WGSL shaders.");
++#       endif
++        }
++        else if (shaderFormat == RenderShaderFormat::SPIRV) {
+             // Choose the pre-compiled shader permutations.
+             const respv::Shader *VS = nullptr;
+             const respv::Shader *PS = nullptr;
+@@ -295,13 +383,54 @@ namespace RT64 {
+ #       endif
+         }
+         
++#if !defined(__APPLE__) && !defined(RT64_WGSL)
++        const std::vector<RenderSpecConstant> specConstants;
++#endif
++        createPipelineFor(pipelineLayout, (vertexShader != nullptr) ? vertexShader.get() : sharedVertexShader, (pixelShader != nullptr) ? pixelShader.get() : sharedPixelShader, specConstants, multisampling);
++    }
++
++    RasterShader::RasterShader(RenderDevice *device, const ShaderDescription &desc, const RenderPipelineLayout *pipelineLayout, const RenderMultisampling &multisampling,
++        const char *vertexWGSL, size_t vertexWGSLSize, const char *pixelWGSL, size_t pixelWGSLSize)
++    {
++        assert(device != nullptr);
++
++        this->device = device;
++        this->desc = desc;
++
++        std::unique_ptr<RenderShader> vertexShader = device->createShader(vertexWGSL, vertexWGSLSize, "VSMain", RenderShaderFormat::WGSL);
++        std::unique_ptr<RenderShader> pixelShader = device->createShader(pixelWGSL, pixelWGSLSize, "PSMain", RenderShaderFormat::WGSL);
++        createPipelineFor(pipelineLayout, vertexShader.get(), pixelShader.get(), {}, multisampling, prebuiltDecalStencil(desc));
++    }
++
++    // A prebuilt decal's pixel shader writes its depth bounds (CMakeLists.txt) and draws with the stencil, which the
++    // depth target has where the device has depth32float-stencil8 (RT64::Application). Without it the prebuilt
++    // decals can't be used, and each is specialized at run time instead, as one the list missed.
++    bool RasterShader::prebuiltDecalStencil(const ShaderDescription &desc) {
++        return (desc.otherMode.zMode() == ZMODE_DEC);
++    }
++
++    void RasterShader::createPipelineFor(const RenderPipelineLayout *pipelineLayout, const RenderShader *vertexShader, const RenderShader *pixelShader, const std::vector<RenderSpecConstant> &specConstants, const RenderMultisampling &multisampling, bool decalStencil) {
+         // Create root signature and PSO.
+-        const bool copyMode = (desc.otherMode.cycleType() == G_CYC_COPY);
+         PipelineCreation creation;
+         creation.device = device;
+         creation.pipelineLayout = pipelineLayout;
+-        creation.vertexShader = vertexShader.get();
+-        creation.pixelShader = pixelShader.get();
++        creation.vertexShader = vertexShader;
++        creation.pixelShader = pixelShader;
++        creation.buildInBackground = true;
++        setPipelineState(desc, creation);
++        creation.specConstants = specConstants;
++        creation.multisampling = multisampling;
++        creation.decalStencil = decalStencil ? DecalStencil::Draw : DecalStencil::None;
++        pipeline = createPipeline(creation);
++        if (decalStencil) {
++            creation.decalStencil = DecalStencil::Mark;
++            decalMarkPipeline = createPipeline(creation);
++        }
++    }
++
++    // What of a description goes into its pipeline besides its shaders.
++    void RasterShader::setPipelineState(const ShaderDescription &desc, PipelineCreation &creation) {
++        const bool copyMode = (desc.otherMode.cycleType() == G_CYC_COPY);
+         creation.alphaBlend = !copyMode && interop::Blender::usesAlphaBlend(desc.otherMode);
+         creation.culling = !copyMode && desc.flags.culling;
+         creation.zCmp = !copyMode && desc.otherMode.zCmp() && (desc.otherMode.zMode() != ZMODE_DEC);
+@@ -320,11 +449,14 @@ namespace RT64 {
+         creation.cvgAdd = !copyMode && ((desc.otherMode.cvgDst() == CVG_DST_WRAP) || (desc.otherMode.cvgDst() == CVG_DST_SAVE));
+         creation.NoN = desc.flags.NoN;
+         creation.usesHDR = desc.flags.usesHDR;
+-#ifdef __APPLE__
+-        creation.specConstants = specConstants;
+-#endif
+-        creation.multisampling = multisampling;
+-        pipeline = createPipeline(creation);
++    }
++
++    // The same for two descriptions whose pipelines differ only in their shaders (setPipelineState()).
++    uint32_t RasterShader::pipelineStateKey(const ShaderDescription &desc) {
++        PipelineCreation creation;
++        setPipelineState(desc, creation);
++        return (creation.alphaBlend ? 0x1U : 0U) | (creation.culling ? 0x2U : 0U) | (creation.zCmp ? 0x4U : 0U) | (creation.zUpd ? 0x8U : 0U) |
++            (creation.cvgAdd ? 0x10U : 0U) | (creation.NoN ? 0x20U : 0U) | (creation.usesHDR ? 0x40U : 0U);
+     }
+ 
+     RasterShader::~RasterShader() { }
+@@ -407,7 +539,7 @@ namespace RT64 {
+         pipelineDesc.depthEnabled = c.zCmp || c.zUpd;
+         pipelineDesc.depthFunction = c.zCmp ? (c.zCmpEqual ? RenderComparisonFunction::LESS_EQUAL : RenderComparisonFunction::LESS) : RenderComparisonFunction::ALWAYS;
+         pipelineDesc.depthWriteEnabled = c.zUpd;
+-        pipelineDesc.depthTargetFormat = RenderFormat::D32_FLOAT;
++        pipelineDesc.depthTargetFormat = RenderTarget::depthBufferFormat();
+         pipelineDesc.multisampling = c.multisampling;
+         pipelineDesc.inputSlots = RasterInputSlots;
+         pipelineDesc.inputSlotsCount = uint32_t(std::size(RasterInputSlots));
+@@ -419,13 +551,16 @@ namespace RT64 {
+         pipelineDesc.pixelShader = c.pixelShader;
+         pipelineDesc.specConstants = c.specConstants.data();
+         pipelineDesc.specConstantsCount = uint32_t(c.specConstants.size());
++        pipelineDesc.buildInBackground = c.buildInBackground;
+ 
+         // Alpha blending is performed by using dual source blending. The blending factor will be in the secondary output.
+         RenderBlendDesc &targetBlend = pipelineDesc.renderTargetBlend[0];
++        // Without dual-source blending (optional in WebGPU), RasterPS writes the factor to its one output's alpha instead.
+         if (c.alphaBlend) {
++            const bool dualSource = c.device->getCapabilities().dualSourceBlending;
+             targetBlend.blendEnabled = true;
+-            targetBlend.srcBlend = RenderBlend::SRC1_ALPHA;
+-            targetBlend.dstBlend = RenderBlend::INV_SRC1_ALPHA;
++            targetBlend.srcBlend = dualSource ? RenderBlend::SRC1_ALPHA : RenderBlend::SRC_ALPHA;
++            targetBlend.dstBlend = dualSource ? RenderBlend::INV_SRC1_ALPHA : RenderBlend::INV_SRC_ALPHA;
+             targetBlend.blendOp = RenderBlendOperation::ADD;
+         }
+ 
+@@ -435,6 +570,38 @@ namespace RT64 {
+             targetBlend.dstBlendAlpha = RenderBlend::ONE;
+         }
+ 
++        // A prebuilt decal on WebGPU checks its depth with two depth tests and writes none (RasterPS.hlsl,
++        // DECAL_DEPTH_BOUNDS). The first draw writes the highest surface depth that passes and no color, and adds one
++        // to the stencil wherever the surface is no deeper; the second writes the lowest, draws where the stencil isn't
++        // zero and the surface is no nearer, and takes one off wherever the stencil isn't zero, so it ends at zero
++        // again, as a depth target's stencil is between draws. The two draws are the same fragments, which the same
++        // pixel shader discards alike, so each fragment of the second finds the first's mark, except where the decal
++        // covers a pixel twice and only one of its fragments passed the first test, where either may draw.
++        if (c.decalStencil != DecalStencil::None) {
++            const bool mark = (c.decalStencil == DecalStencil::Mark);
++            RenderStencilFaceDesc stencilFace;
++            if (mark) {
++                stencilFace.compareFunction = RenderComparisonFunction::ALWAYS;
++                stencilFace.passOp = RenderStencilOp::INCREMENT_AND_CLAMP;
++                targetBlend.renderTargetWriteMask = 0;
++            }
++            else {
++                stencilFace.compareFunction = RenderComparisonFunction::NOT_EQUAL;
++                stencilFace.passOp = RenderStencilOp::DECREMENT_AND_CLAMP;
++                stencilFace.depthFailOp = RenderStencilOp::DECREMENT_AND_CLAMP;
++            }
++
++            pipelineDesc.depthEnabled = true;
++            pipelineDesc.depthWriteEnabled = false;
++            pipelineDesc.depthFunction = mark ? RenderComparisonFunction::GREATER_EQUAL : RenderComparisonFunction::LESS_EQUAL;
++            pipelineDesc.stencilEnabled = true;
++            pipelineDesc.stencilReadMask = 0xFF;
++            pipelineDesc.stencilWriteMask = 0xFF;
++            pipelineDesc.stencilReference = 0;
++            pipelineDesc.stencilFrontFace = stencilFace;
++            pipelineDesc.stencilBackFace = stencilFace;
++        }
++
+         return c.device->createGraphicsPipeline(pipelineDesc);
+     }
+     
+@@ -515,12 +682,33 @@ namespace RT64 {
+             PSBlobSize = uint32_t(useMSAA ? std::size(RasterPSDynamicMSBlobDXIL) : std::size(RasterPSDynamicBlobDXIL));
+             break;
+ #   endif
+-        case RenderShaderFormat::SPIRV:
+-            VSBlob = RasterVSDynamicBlobSPIRV;
+-            PSBlob = useMSAA ? RasterPSDynamicMSBlobSPIRV : RasterPSDynamicBlobSPIRV;
+-            VSBlobSize = uint32_t(std::size(RasterVSDynamicBlobSPIRV));
+-            PSBlobSize = uint32_t(useMSAA ? std::size(RasterPSDynamicMSBlobSPIRV) : std::size(RasterPSDynamicBlobSPIRV));
++#   if defined(RT64_WGSL)
++        case RenderShaderFormat::WGSL: {
++            const bool dualSource = device->getCapabilities().dualSourceBlending;
++            VSBlob = RasterVSDynamicBlobWGSL;
++            VSBlobSize = uint32_t(sizeof(RasterVSDynamicBlobWGSL));
++            if (useMSAA) {
++                PSBlob = dualSource ? RasterPSDynamicMSDualSourceBlobWGSL : RasterPSDynamicMSBlobWGSL;
++                PSBlobSize = uint32_t(dualSource ? sizeof(RasterPSDynamicMSDualSourceBlobWGSL) : sizeof(RasterPSDynamicMSBlobWGSL));
++            }
++            else {
++                PSBlob = dualSource ? RasterPSDynamicDualSourceBlobWGSL : RasterPSDynamicBlobWGSL;
++                PSBlobSize = uint32_t(dualSource ? sizeof(RasterPSDynamicDualSourceBlobWGSL) : sizeof(RasterPSDynamicBlobWGSL));
++            }
++            break;
++        }
++#   else
++        case RenderShaderFormat::SPIRV: {
++            const RenderDeviceCapabilities &capabilities = device->getCapabilities();
++            const SPIRVBlob VS = RT64_TEXTURE_SETS_SPIRV(RasterVSDynamic, capabilities);
++            const SPIRVBlob PS = useMSAA ? RT64_TEXTURE_SETS_SPIRV(RasterPSDynamicMS, capabilities) : RT64_TEXTURE_SETS_SPIRV(RasterPSDynamic, capabilities);
++            VSBlob = VS.data;
++            PSBlob = PS.data;
++            VSBlobSize = uint32_t(VS.size);
++            PSBlobSize = uint32_t(PS.size);
+             break;
++        }
++#   endif
+ #   ifdef __APPLE__
+         case RenderShaderFormat::METAL:
+             VSBlob = RasterVSDynamicBlobMSL;
+@@ -538,14 +726,12 @@ namespace RT64 {
+         pixelShader = device->createShader(PSBlob, PSBlobSize, "PSMain", shaderFormat);
+ 
+         FramebufferRendererDescriptorCommonSet descriptorCommonSet(shaderLibrary->samplerLibrary, device->getCapabilities().raytracing);
+-        FramebufferRendererDescriptorTextureSet descriptorTextureSet;
+         FramebufferRendererDescriptorFramebufferSet descriptorFramebufferSet;
+         RenderPipelineLayoutBuilder layoutBuilder;
+         layoutBuilder.begin(false, true);
+         layoutBuilder.addPushConstant(0, 0, sizeof(interop::RasterParams), RenderShaderStageFlag::VERTEX | RenderShaderStageFlag::PIXEL);
+         layoutBuilder.addDescriptorSet(descriptorCommonSet);
+-        layoutBuilder.addDescriptorSet(descriptorTextureSet);
+-        layoutBuilder.addDescriptorSet(descriptorTextureSet);
++        addFramebufferRendererTextureSets(layoutBuilder, device->getCapabilities());
+         layoutBuilder.addDescriptorSet(descriptorFramebufferSet);
+         layoutBuilder.end();
+         pipelineLayout = layoutBuilder.create(device);
+@@ -598,11 +784,24 @@ namespace RT64 {
+             postBlendSubNegativePixelShader = device->createShader(PostBlendDitherNoiseSubNegativePSBlobDXIL, std::size(PostBlendDitherNoiseSubNegativePSBlobDXIL), "PSMain", shaderFormat);
+             break;
+ #   endif
+-        case RenderShaderFormat::SPIRV:
+-            postBlendAddPixelShader = device->createShader(PostBlendDitherNoiseAddPSBlobSPIRV, std::size(PostBlendDitherNoiseAddPSBlobSPIRV), "PSMain", shaderFormat);
+-            postBlendSubPixelShader = device->createShader(PostBlendDitherNoiseSubPSBlobSPIRV, std::size(PostBlendDitherNoiseSubPSBlobSPIRV), "PSMain", shaderFormat);
+-            postBlendSubNegativePixelShader = device->createShader(PostBlendDitherNoiseSubNegativePSBlobSPIRV, std::size(PostBlendDitherNoiseSubNegativePSBlobSPIRV), "PSMain", shaderFormat);
++#   if defined(RT64_WGSL)
++        case RenderShaderFormat::WGSL:
++            postBlendAddPixelShader = device->createShader(PostBlendDitherNoiseAddPSBlobWGSL, sizeof(PostBlendDitherNoiseAddPSBlobWGSL), "PSMain", shaderFormat);
++            postBlendSubPixelShader = device->createShader(PostBlendDitherNoiseSubPSBlobWGSL, sizeof(PostBlendDitherNoiseSubPSBlobWGSL), "PSMain", shaderFormat);
++            postBlendSubNegativePixelShader = device->createShader(PostBlendDitherNoiseSubNegativePSBlobWGSL, sizeof(PostBlendDitherNoiseSubNegativePSBlobWGSL), "PSMain", shaderFormat);
++            break;
++#   else
++        case RenderShaderFormat::SPIRV: {
++            const RenderDeviceCapabilities &capabilities = device->getCapabilities();
++            const SPIRVBlob add = RT64_TEXTURE_SETS_SPIRV(PostBlendDitherNoiseAddPS, capabilities);
++            const SPIRVBlob sub = RT64_TEXTURE_SETS_SPIRV(PostBlendDitherNoiseSubPS, capabilities);
++            const SPIRVBlob subNegative = RT64_TEXTURE_SETS_SPIRV(PostBlendDitherNoiseSubNegativePS, capabilities);
++            postBlendAddPixelShader = device->createShader(add.data, add.size, "PSMain", shaderFormat);
++            postBlendSubPixelShader = device->createShader(sub.data, sub.size, "PSMain", shaderFormat);
++            postBlendSubNegativePixelShader = device->createShader(subNegative.data, subNegative.size, "PSMain", shaderFormat);
+             break;
++        }
++#   endif
+ #   ifdef __APPLE__
+         case RenderShaderFormat::METAL:
+             postBlendAddPixelShader = device->createShader(PostBlendDitherNoiseAddPSBlobMSL, std::size(PostBlendDitherNoiseAddPSBlobMSL), "PSMain", shaderFormat);
+@@ -620,7 +819,7 @@ namespace RT64 {
+         postBlendDesc.renderTargetFormat[0] = RenderTarget::colorBufferFormat(shaderLibrary->usesHDR);
+         postBlendDesc.renderTargetCount = 1;
+         postBlendDesc.cullMode = RenderCullMode::NONE;
+-        postBlendDesc.depthTargetFormat = RenderFormat::D32_FLOAT;
++        postBlendDesc.depthTargetFormat = RenderTarget::depthBufferFormat();
+         postBlendDesc.multisampling = multisampling;
+         postBlendDesc.inputSlots = RasterInputSlots;
+         postBlendDesc.inputSlotsCount = uint32_t(std::size(RasterInputSlots));
+diff --git b/src/render/rt64_raster_shader.h a/src/render/rt64_raster_shader.h
+index 53ba350..7496c81 100644
+--- b/src/render/rt64_raster_shader.h
++++ a/src/render/rt64_raster_shader.h
+@@ -9,6 +9,7 @@
+ #include <condition_variable>
+ #include <mutex>
+ #include <thread>
++#include <unordered_map>
+ 
+ #include "re-spirv/re-spirv.h"
+ 
+@@ -37,7 +38,25 @@ namespace RT64 {
+         respv::Shader rasterPSFlat;
+         respv::Shader rasterPSFlatMS;
+ 
+-        void initialize();
++        void initialize(const RenderDeviceCapabilities &capabilities);
++    };
++
++    // The spec constant shaders a WGSL build specializes with override values, each created once: they are the same
++    // source for every shader, and creating a RasterPS module (250 KB of WGSL) costs the browser a parse each time.
++    struct ShaderCacheWGSL {
++        std::mutex mutex;
++        std::unordered_map<const void *, std::unique_ptr<RenderShader>> shaders;
++
++        // The vertex and pixel shader every shader specializes, created on first use.
++        void get(RenderDevice *device, bool useMSAA, const RenderShader *&vertexShader, const RenderShader *&pixelShader);
++        const RenderShader *get(RenderDevice *device, const void *blob, uint64_t size, const char *entryPointName);
++    };
++
++    // A prebuilt decal's two draws on WebGPU (RasterShader::createPipeline()).
++    enum class DecalStencil {
++        None,
++        Mark,
++        Draw
+     };
+ 
+     struct PipelineCreation {
+@@ -55,6 +74,8 @@ namespace RT64 {
+         bool usesHDR;
+         std::vector<RenderSpecConstant> specConstants;
+         RenderMultisampling multisampling;
++        bool buildInBackground = false;
++        DecalStencil decalStencil = DecalStencil::None;
+     };
+ 
+     struct RasterShaderText {
+@@ -67,8 +88,13 @@ namespace RT64 {
+         RenderDevice *device;
+         std::unique_ptr<RenderPipeline> pipeline;
+ 
++        // A prebuilt decal's pixel shader writes the bounds of the decal check as its depth (RasterPS.hlsl,
++        // DECAL_DEPTH_BOUNDS), and the decal draws twice in the pass that writes depth: with this pipeline and then
++        // with the one above (createPipeline()). Null for every other shader.
++        std::unique_ptr<RenderPipeline> decalMarkPipeline;
++
+         RasterShader(RenderDevice *device, const ShaderDescription &desc, const RenderPipelineLayout *pipelineLayout, RenderShaderFormat shaderFormat, const RenderMultisampling &multisampling, 
+-            const ShaderCompiler *shaderCompiler, const OptimizerCacheSPIRV *optimizerCacheSPIRV, ShaderBlobCache *blobCache = nullptr);
++            const ShaderCompiler *shaderCompiler, const OptimizerCacheSPIRV *optimizerCacheSPIRV, ShaderCacheWGSL *shaderCacheWGSL, ShaderBlobCache *blobCache = nullptr);
+ 
+         // Names one compiled stage by the source that produced it: the generated
+         // HLSL for this shader description, the library blob it links against, and
+@@ -79,7 +105,16 @@ namespace RT64 {
+         // cache can serve something that no longer matches the code.
+         static uint64_t blobCacheKey(const std::string &shaderText, uint64_t libraryHash, uint32_t stage);
+ 
++        // A shader specialized when the program was built (RT64_PREBUILT_SHADER_LIST in CMakeLists.txt): WGSL with the
++        // description's spec constants folded in, so the browser builds it from far less code.
++        RasterShader(RenderDevice *device, const ShaderDescription &desc, const RenderPipelineLayout *pipelineLayout, const RenderMultisampling &multisampling,
++            const char *vertexWGSL, size_t vertexWGSLSize, const char *pixelWGSL, size_t pixelWGSLSize);
++
+         ~RasterShader();
++        void createPipelineFor(const RenderPipelineLayout *pipelineLayout, const RenderShader *vertexShader, const RenderShader *pixelShader, const std::vector<RenderSpecConstant> &specConstants, const RenderMultisampling &multisampling, bool decalStencil = false);
++        static bool prebuiltDecalStencil(const ShaderDescription &desc);
++        static void setPipelineState(const ShaderDescription &desc, PipelineCreation &creation);
++        static uint32_t pipelineStateKey(const ShaderDescription &desc);
+         static RasterShaderText generateShaderText(const ShaderDescription &desc, bool multisampling);
+         static std::unique_ptr<RenderPipeline> createPipeline(const PipelineCreation &c);
+         static RenderMultisampling generateMultisamplingPattern(uint32_t sampleCount, bool sampleLocationsSupported);
+diff --git b/src/render/rt64_raster_shader_cache.cpp a/src/render/rt64_raster_shader_cache.cpp
+index 30dc357..6cc9c5b 100644
+--- b/src/render/rt64_raster_shader_cache.cpp
++++ a/src/render/rt64_raster_shader_cache.cpp
+@@ -7,6 +7,52 @@
+ #include "common/rt64_thread.h"
+ #include "hle/rt64_snap_diag.h"
+ 
++#if defined(__EMSCRIPTEN__)
++#   include <emscripten/emscripten.h>
++#endif
++
++#if defined(RT64_PREBUILT_SHADERS)
++#   include <cstring>
++#   include <zstd.h>
++#   include "common/rt64_elapsed_timer.h"
++#   include "rt64_prebuilt_shaders.h"
++#   include "rt64_render_target.h"
++
++// The size of the pixel shader built for a prebuilt shader, on a device with dual-source blending or without.
++static uint32_t prebuiltPixelSize(const RT64PrebuiltShader &entry, bool dualSource) {
++    return dualSource ? entry.pixelSize : entry.pixelSingleSize;
++}
++
++// The WGSL built for a prebuilt shader, which goes with the time it takes.
++static uint64_t prebuiltSize(const RT64PrebuiltShader &entry, bool dualSource) {
++    return uint64_t(entry.vertexSize) + prebuiltPixelSize(entry, dualSource);
++}
++
++static RT64::ShaderDescription prebuiltDescription(const RT64PrebuiltShader &entry) {
++    RT64::ShaderDescription desc;
++    memset(&desc, 0, sizeof(desc));
++    desc.otherMode.L = entry.otherModeL;
++    desc.otherMode.H = entry.otherModeH;
++    desc.colorCombiner.L = entry.combinerL;
++    desc.colorCombiner.H = entry.combinerH;
++    desc.flags.value = entry.flags;
++    return desc;
++}
++
++// How many of a section's shaders a frame must want for the game to wait for the section (startPrebuild()).
++static const uint32_t PrebuildSectionMinimum = 4;
++
++// The most shaders a page remembers the list missed (learnPrebuild()).
++static const uint32_t LearnedMaximum = 1000;
++
++// A learned shader is built from the ubershader's WGSL with its spec constants as overrides, which takes longer than
++// a prebuilt one: it counts as the largest, for the progress and for its place in a round.
++static const uint64_t LearnedSize = 400000;
++#endif
++
++// On WebGPU a specialized RasterPS takes 1.4-2 s to build in the browser's GPU process (Chrome, RTX 2070). plume's
++// WebGPU backend builds it with createRenderPipelineAsync and the compilation thread waits for it, so the ubershader
++// draws meanwhile, as everywhere else.
+ #define ENABLE_OPTIMIZED_SHADER_GENERATION
+ 
+ namespace RT64 {
+@@ -61,7 +107,7 @@ namespace RT64 {
+                 assert((shaderCache->shaderUber != nullptr) && "Ubershader should've been created by the time a new shader is submitted to the cache.");
+                 const RenderPipelineLayout *uberPipelineLayout = shaderCache->shaderUber->pipelineLayout.get();
+                 const RenderMultisampling multisampling = shaderCache->multisampling;
+-                std::unique_ptr<RasterShader> newShader = std::make_unique<RasterShader>(shaderCache->device, shaderDesc, uberPipelineLayout, shaderCache->shaderFormat, multisampling, shaderCache->shaderCompiler.get(), &shaderCache->optimizerCacheSPIRV, shaderCache->blobCache.get());
++                std::unique_ptr<RasterShader> newShader = std::make_unique<RasterShader>(shaderCache->device, shaderDesc, uberPipelineLayout, shaderCache->shaderFormat, multisampling, shaderCache->shaderCompiler.get(), &shaderCache->optimizerCacheSPIRV, &shaderCache->shaderCacheWGSL, shaderCache->blobCache.get());
+ 
+                 {
+                     const std::unique_lock<std::mutex> lock(shaderCache->GPUShadersMutex);
+@@ -102,6 +148,15 @@ namespace RT64 {
+ 
+     RasterShaderCache::~RasterShaderCache() {
+         compilationThreads.clear();
++        {
++            std::unique_lock<std::mutex> lock(prebuildMutex);
++            prebuildStop = true;
++        }
++
++        prebuildChanged.notify_all();
++        for (std::thread &thread : prebuildThreads) {
++            thread.join();
++        }
+     }
+ 
+     void RasterShaderCache::setup(RenderDevice *device, RenderShaderFormat shaderFormat, const ShaderLibrary *shaderLibrary, const RenderMultisampling &multisampling) {
+@@ -114,9 +169,476 @@ namespace RT64 {
+         shaderUber = std::make_unique<RasterShaderUber>(device, shaderFormat, multisampling, shaderLibrary, ubershaderThreadCount);
+         usesHDR = shaderLibrary->usesHDR;
+ 
++        // Where building a pipeline holds up the device (WebGPU in Firefox), a specialized shader stalls the frames
++        // for longer than the ubershader it replaces costs them, and a race asks for a new one every few seconds.
++        // What isn't prebuilt is built with the game waiting there (buildMissed()), never behind it.
++        specializedShaders = device->getCapabilities().backgroundPipelineBuilds;
++
++        // The prebuilt shaders are built wherever a game has a list, whatever the browser and the adapter: they are
++        // built before the game starts, when holding up the device costs nothing, and without them a weak GPU draws
++        // everything with the ubershader, a frame a second (startPrebuild()).
++#   if defined(RT64_PREBUILT_SHADERS)
++        prebuiltShaders = (shaderFormat == RenderShaderFormat::WGSL) && (multisampling.sampleCount == 1);
++#   endif
++
++#   if defined(__EMSCRIPTEN__)
++        // A page opened with ?record-shaders prints every shader the game asks for, for a list of prebuilt shaders
++        // (RT64_PREBUILT_SHADER_LIST in CMakeLists.txt says how it is used).
++        recordShaders = MAIN_THREAD_EM_ASM_INT({ return new URLSearchParams(location.search).has('record-shaders') ? 1 : 0; }) != 0;
++#   endif
++
+         // Initialize the re-spirv optimizer cache.
+         if (shaderFormat == RenderShaderFormat::SPIRV) {
+-            optimizerCacheSPIRV.initialize();
++            optimizerCacheSPIRV.initialize(device->getCapabilities());
++        }
++
++        // Create the spec constant shaders before anything draws. plume's WebGPU backend learns from each new shader which
++        // stages read which bindings, and when that changes every pipeline gets a new layout: the specialized ones that
++        // were drawn with would then be built again in place, holding up the browser's GPU process for seconds. Without
++        // specialized or prebuilt shaders nothing needs them, and RasterPS is 250 KB of WGSL for the browser to parse.
++        if ((shaderFormat == RenderShaderFormat::WGSL) && (specializedShaders || prebuiltShaders)) {
++            const RenderShader *vertexShader = nullptr;
++            const RenderShader *pixelShader = nullptr;
++            shaderCacheWGSL.get(device, multisampling.sampleCount > 1, vertexShader, pixelShader);
++        }
++
++        startPrebuild();
++    }
++
++    // The prebuilt shaders are the ones a game recorded (?record-shaders), specialized when the program was built and
++    // built here before the game asks for them or with it waiting, so a weak GPU never draws a frame mostly with the
++    // ubershader, which costs several times what they do per pixel (on a laptop's Intel graphics it was the difference
++    // between a frame a second and 60), and no shader is built in the middle of play where that would stall it. Built from the ubershader's WGSL with the spec constants as overrides, a
++    // specialized RasterPS took 6 s cold in Chrome (RTX 2070); specialized beforehand, 1-1.6 s. Chrome keeps them in its
++    // WebGPU cache, so a later visit builds them in a fraction of the time (Chrome 154: Rush 2049's 105 in 0.4 s). That
++    // cache holds 6 MB a profile, every site's together: past it, the least recently used go.
++    //
++    // The list is in sections, a game's screens or levels (rt64_prebuilt_shaders.h), so a game with many levels doesn't
++    // keep the player waiting for all of them at the start: GoldenEye's 455, its menus and every level's start, are
++    // 2.5 s for the menus and 6.6 s for Dam, cold (2026-10-13, Chrome 155 headless, RTX 2070, 12 threads). Every
++    // prebuilt shader a frame asks for that isn't built is wanted (wantPrebuild()), and before the next frame
++    // waitForPrebuild() looks for the section that holds the most of them: if that is at least PrebuildSectionMinimum,
++    // the game has gone somewhere new and a round builds them, the game waiting. Fewer are strays, a shader one level
++    // shares with another that the recording didn't see there, built behind the game, which draws them with the
++    // ubershader meanwhile: a wait for one shader would cost more than it saves.
++    //
++    // Where pipelines build in the background (Chrome), the game waits only for what a frame wants. One thread builds
++    // the whole list behind the game from the first draw (prebuildAhead), a section at a time in the list's order, the
++    // order the recording reached them in; a round moves the rest of its section to the front, and strays go before
++    // that. Section 0, the boot, has only a few seconds of logos before the game wants the rest, and section 1 is
++    // usually what follows it by itself or a press of Start later (the attract demo, the menus), so half the threads
++    // build those two; the rest is built one at a time, since each thread takes a core in the browser's GPU process and
++    // levels come minutes apart. With section 1 on one thread, a list whose boot ends at the title (Pilotwings 64's,
++    // so that Firefox draws the title before it builds the menus) waited 3-8 s in Chrome on the menus' 28-36 after Start,
++    // where with them in the boot it never had. So the first frame waits only for its own shaders, the panel the page showed for a whole section before the
++    // game started is mostly gone, and a level reached after a minute of play is usually built before the game gets
++    // there. Where building a pipeline holds up the device (Firefox, setup()), anything built behind the game would
++    // stall its frames, so nothing is: section 0 is built before the game gets past its first frame, a round builds
++    // every shader of its section not yet built, and the game waits for strays too.
++    //
++    // A pipeline is built for the WebGPU layout a draw with its pipeline layout resolved (plume_webgpu.h), so section 0
++    // waits for the first frame's draws; where pipelines build in the background (Chrome) that is the draw of nothing
++    // at setup (State::warmUpPipelines()), and the list builds behind the launcher. A round is built on as many threads as the host has cores (2-16), since the
++    // game waits and the browser's GPU process has nothing else to do, largest first: a shader's WGSL size goes with
++    // its build time, and the largest (370 KB against a median of 65 KB) started last would leave the other threads idle
++    // while it finished. Rush 2049's 105 took 15.6-16.7 s six at a time in the list's order, and 6.9-7.2 s twelve at a
++    // time largest first (2026-10-12, Chrome 154 headless, RTX 2070, 12 cores). Each one of a round done is reported
++    // to the page as Module.rt64ShaderProgress(done, count, fraction) for it to show, the fraction by WGSL size, the
++    // nearest thing to time there is, with each one in flight counted half done: counting only the ones done, the
++    // first seconds read as a third of the pace they were, since every thread starts on one of the largest. They are
++    // made without MSAA, as the web draws, with RasterPS both with dual-source blending and without, for a device that
++    // lacks it. A page opened with ?record-shaders prebuilds none, so that it prints every shader the game asks for, in
++    // the order it asks.
++#   if defined(RT64_PREBUILT_SHADERS)
++    // The WGSL a round builds for a prebuilt or learned shader.
++    static uint64_t roundSize(uint32_t index, bool dualSource) {
++        return (index < RT64PrebuiltShaderCount) ? prebuiltSize(RT64PrebuiltShaderList[index], dualSource) : LearnedSize;
++    }
++#   endif
++
++    void RasterShaderCache::startPrebuild() {
++#   if defined(RT64_PREBUILT_SHADERS)
++        if (!prebuiltShaders || recordShaders) {
++            return;
++        }
++
++        prebuildText.resize(RT64PrebuiltShaderTextSize);
++        const size_t textSize = ZSTD_decompress(prebuildText.data(), prebuildText.size(), RT64PrebuiltShaderData, RT64PrebuiltShaderDataSize);
++        if (textSize != RT64PrebuiltShaderTextSize) {
++            fprintf(stderr, "RT64: the prebuilt shaders didn't decompress: %s\n", ZSTD_isError(textSize) ? ZSTD_getErrorName(textSize) : "wrong size");
++            return;
++        }
++
++        // What is prebuilt is never queued for the compilation threads. Descriptions that differ only in what their
++        // shaders ignore get the same shaders (the specializer's spirv-opt), and many of those the same pipeline state
++        // too: GoldenEye's 455 are 193 pipelines, Dam's 108 69. Each pipeline is built once, for the first description
++        // in the list that has it, and the others' hashes are its aliases, which draw with it. Building them all, a
++        // round largest first started the copies of one pipeline side by side, and the browser built each one again:
++        // Dam's round took 9.6 s cold against 6.6 s (measured as above). Chrome's cache held as much either way, since
++        // it keeps a pipeline once whoever asks for it, so a later visit gains nothing.
++        std::vector<uint32_t> primaries(RT64PrebuiltShaderCount);
++        uint32_t pipelineCount = 0;
++        {
++            const bool dualSource = device->getCapabilities().dualSourceBlending;
++            std::map<std::tuple<uint32_t, uint32_t, uint32_t>, uint32_t> pipelines;
++            prebuildAliases.resize(RT64PrebuiltShaderCount);
++            std::unique_lock<std::mutex> queueLock(submissionMutex);
++            for (uint32_t i = 0; i < RT64PrebuiltShaderCount; i++) {
++                const RT64PrebuiltShader &entry = RT64PrebuiltShaderList[i];
++                const ShaderDescription desc = prebuiltDescription(entry);
++                const uint32_t pixelOffset = dualSource ? entry.pixelOffset : entry.pixelSingleOffset;
++                const auto pipeline = pipelines.emplace(std::make_tuple(entry.vertexOffset, pixelOffset, RasterShader::pipelineStateKey(desc)), i);
++                const uint64_t shaderHash = desc.hash();
++                primaries[i] = pipeline.first->second;
++                shaderHashes[shaderHash] = true;
++                prebuildIndices[shaderHash] = primaries[i];
++                if (pipeline.second) {
++                    pipelineCount++;
++                }
++                else {
++                    prebuildAliases[primaries[i]].emplace_back(shaderHash);
++                }
++            }
++
++            learnPrebuild();
++        }
++
++        // A section's pipelines, and what was learned for it.
++        prebuildSections.resize(RT64PrebuiltShaderSectionCount);
++        std::vector<uint32_t> sectionOf(RT64PrebuiltShaderCount, UINT32_MAX);
++        for (uint32_t s = 0; s < RT64PrebuiltShaderSectionCount; s++) {
++            const RT64PrebuiltShaderSection &entries = RT64PrebuiltShaderSections[s];
++            for (uint32_t i = 0; i < entries.count; i++) {
++                const uint32_t index = primaries[RT64PrebuiltShaderSectionEntries[entries.first + i]];
++                if (sectionOf[index] != s) {
++                    sectionOf[index] = s;
++                    prebuildSections[s].emplace_back(index);
++                }
++            }
++
++            if (s < prebuildLearnedSections.size()) {
++                prebuildSections[s].insert(prebuildSections[s].end(), prebuildLearnedSections[s].begin(), prebuildLearnedSections[s].end());
++            }
++        }
++
++        prebuildCount = pipelineCount + uint32_t(prebuildLearned.size());
++        prebuildState.assign(RT64PrebuiltShaderCount + prebuildLearned.size(), PrebuildQueued);
++        prebuildBoot.assign(prebuildState.size(), false);
++        for (uint32_t s = 0; s < std::min<uint32_t>(uint32_t(prebuildSections.size()), 2U); s++) {
++            for (uint32_t index : prebuildSections[s]) {
++                prebuildBoot[index] = true;
++            }
++        }
++
++        const uint32_t threads = std::clamp(std::thread::hardware_concurrency(), 2U, 16U);
++        prebuildBootThreads = std::max(threads / 2, 1U);
++        {
++            std::unique_lock<std::mutex> lock(prebuildMutex);
++            if (specializedShaders) {
++                for (const std::vector<uint32_t> &section : prebuildSections) {
++                    prebuildAhead.insert(prebuildAhead.end(), section.begin(), section.end());
++                }
++
++                for (uint32_t i = 0; i < RT64PrebuiltShaderCount; i++) {
++                    if ((primaries[i] == i) && (sectionOf[i] == UINT32_MAX)) {
++                        prebuildAhead.emplace_back(i);
++                    }
++                }
++            }
++            else {
++                startPrebuildRound(0, lock);
++            }
++        }
++
++        for (uint32_t t = 0; t < threads; t++) {
++            prebuildThreads.emplace_back(&RasterShaderCache::prebuildLoop, this, t);
++        }
++
++        if (specializedShaders) {
++            printf("RT64: %u prebuilt shaders, %u pipelines, in %u sections, and %u learned; built behind the game once it draws (sections %s and %s %u at a time, the rest one), the game waiting only for what a frame wants, %u at a time\n",
++                RT64PrebuiltShaderCount, pipelineCount, RT64PrebuiltShaderSectionCount, uint32_t(prebuildLearned.size()), RT64PrebuiltShaderSections[0].name,
++                (RT64PrebuiltShaderSectionCount > 1) ? RT64PrebuiltShaderSections[1].name : "(none)", prebuildBootThreads, threads);
++        }
++        else {
++            printf("RT64: %u prebuilt shaders, %u pipelines, in %u sections, and %u learned; the game waiting for the %u of section %s, built %u at a time once the game draws\n",
++                RT64PrebuiltShaderCount, pipelineCount, RT64PrebuiltShaderSectionCount, uint32_t(prebuildLearned.size()), uint32_t(prebuildRound.size()),
++                RT64PrebuiltShaderSections[0].name, threads);
++        }
++#   endif
++    }
++
++    // A shader the list missed costs the player a moment of the ubershader and a build behind the game, so the page
++    // remembers it, with the section the game was in, and the next visit builds it with that section, the game
++    // waiting, as if the list had it: each player's gaps fill themselves in, whatever the game, with no more recording.
++    // RT64 asks the page for what it remembers as Module.rt64LearnedShaders(list), an array of [section, other mode L
++    // and H, combiner L and H, flags], and tells it of a new one as Module.rt64ShaderMissed(list, entry); `list` is a
++    // number that changes with the list, since a section's index means nothing to another one. N64Recomp-browser's
++    // shell keeps them in localStorage. Called with submissionMutex held.
++    void RasterShaderCache::learnPrebuild() {
++#   if defined(RT64_PREBUILT_SHADERS) && defined(__EMSCRIPTEN__)
++        std::vector<uint32_t> learned(LearnedMaximum * 6);
++        const uint32_t listId = RT64PrebuiltShaderDataSize * 31U + RT64PrebuiltShaderCount;
++        const int count = MAIN_THREAD_EM_ASM_INT({
++            const learned = Module['rt64LearnedShaders'] ? Module['rt64LearnedShaders']($0 >>> 0) : [];
++            const count = Math.min(learned.length, $2);
++            for (let i = 0; i < count; i++) {
++                for (let j = 0; j < 6; j++) {
++                    HEAPU32[($1 >> 2) + i * 6 + j] = learned[i][j];
++                }
++            }
++
++            return count;
++        }, listId, learned.data(), LearnedMaximum);
++
++        prebuildLearnedSections.resize(RT64PrebuiltShaderSectionCount);
++        for (int i = 0; i < count; i++) {
++            const uint32_t *entry = &learned[i * 6];
++            if (entry[0] >= RT64PrebuiltShaderSectionCount) {
++                continue;
++            }
++
++            ShaderDescription desc;
++            memset(&desc, 0, sizeof(desc));
++            desc.otherMode.L = entry[1];
++            desc.otherMode.H = entry[2];
++            desc.colorCombiner.L = entry[3];
++            desc.colorCombiner.H = entry[4];
++            desc.flags.value = entry[5];
++            const uint64_t shaderHash = desc.hash();
++            if (prebuildIndices.find(shaderHash) != prebuildIndices.end()) {
++                continue;
++            }
++
++            const uint32_t index = RT64PrebuiltShaderCount + uint32_t(prebuildLearned.size());
++            prebuildLearned.emplace_back(desc);
++            prebuildLearnedSections[entry[0]].emplace_back(index);
++            prebuildIndices[shaderHash] = index;
++            shaderHashes[shaderHash] = true;
++        }
++#   endif
++    }
++
++    // A draw asked for a shader the list doesn't have (learnPrebuild()).
++    void RasterShaderCache::reportMissed(const ShaderDescription &desc) {
++#   if defined(RT64_PREBUILT_SHADERS) && defined(__EMSCRIPTEN__)
++        const uint32_t listId = RT64PrebuiltShaderDataSize * 31U + RT64PrebuiltShaderCount;
++        MAIN_THREAD_ASYNC_EM_ASM({
++            if (Module['rt64ShaderMissed']) Module['rt64ShaderMissed']($0 >>> 0, [$1 >>> 0, $2 >>> 0, $3 >>> 0, $4 >>> 0, $5 >>> 0, $6 >>> 0]);
++        }, listId, prebuildSection.load(), desc.otherMode.L, desc.otherMode.H, desc.colorCombiner.L, desc.colorCombiner.H, desc.flags.value);
++#   endif
++    }
++
++    // Starts a round: every shader wanted, the game waiting, and the rest of a section (UINT32_MAX for none) not built
++    // or being built, next behind the game or, where nothing is built behind it, in the round too. Called with
++    // prebuildMutex held.
++    void RasterShaderCache::startPrebuildRound(uint32_t section, std::unique_lock<std::mutex> &lock) {
++#   if defined(RT64_PREBUILT_SHADERS)
++        const bool dualSource = device->getCapabilities().dualSourceBlending;
++        prebuildRound.clear();
++        if (section < RT64PrebuiltShaderSectionCount) {
++            prebuildSection = section;
++            const std::vector<uint32_t> &indices = prebuildSections[section];
++            for (auto it = indices.rbegin(); it != indices.rend(); it++) {
++                if (prebuildState[*it] == PrebuildTaken) {
++                    continue;
++                }
++                else if (specializedShaders) {
++                    prebuildAhead.emplace_front(*it);
++                }
++                else {
++                    prebuildState[*it] = PrebuildTaken;
++                    prebuildRound.emplace_back(*it);
++                }
++            }
++        }
++
++        for (uint32_t index : prebuildWanted) {
++            if (prebuildState[index] == PrebuildWanted) {
++                prebuildState[index] = PrebuildTaken;
++                prebuildRound.emplace_back(index);
++            }
++        }
++
++        prebuildWanted.clear();
++        std::stable_sort(prebuildRound.begin(), prebuildRound.end(), [dualSource](uint32_t a, uint32_t b) {
++            return roundSize(a, dualSource) > roundSize(b, dualSource);
++        });
++
++        prebuildRoundNext = 0;
++        prebuildRoundDone = 0;
++        prebuildRoundSize = 0;
++        prebuildRoundSizeDone = 0;
++        prebuildRoundSizeStarted = 0;
++        for (uint32_t index : prebuildRound) {
++            prebuildRoundSize += roundSize(index, dualSource);
++        }
++
++        // Section 0's is reported once the game draws (getGPUShader()): nothing the launcher draws uses it.
++        prebuildRoundHeld = !prebuildRound.empty();
++        if (prebuildRoundHeld && prebuildDrawn) {
++            prebuildTimer.reset();
++            printf("RT64: building %u prebuilt shaders for section %s, the game waiting\n", uint32_t(prebuildRound.size()),
++                (section < RT64PrebuiltShaderSectionCount) ? RT64PrebuiltShaderSections[section].name : "(none)");
++            reportPrebuild(0, uint32_t(prebuildRound.size()), 0, 0, prebuildRoundSize);
++        }
++
++        prebuildChanged.notify_all();
++#   endif
++    }
++
++    void RasterShaderCache::reportPrebuild(uint32_t done, uint32_t count, uint64_t sizeDone, uint64_t sizeStarted, uint64_t size) {
++#   if defined(__EMSCRIPTEN__)
++        const double fraction = (size > 0) ? double(sizeDone + sizeStarted) / double(2 * size) : 1.0;
++        MAIN_THREAD_ASYNC_EM_ASM({ if (Module['rt64ShaderProgress']) Module['rt64ShaderProgress']($0, $1, $2); }, done, count, fraction);
++#   endif
++    }
++
++    // Every thread builds the round's shaders, and between rounds the first one builds ahead of the game, with up to
++    // half of them while what is next is section 0's or 1's (startPrebuild()).
++    void RasterShaderCache::prebuildLoop(uint32_t thread) {
++#   if defined(RT64_PREBUILT_SHADERS)
++        Thread::setCurrentThreadName("RT64 Prebuild");
++        const bool dualSource = device->getCapabilities().dualSourceBlending;
++        std::unique_lock<std::mutex> lock(prebuildMutex);
++        while (true) {
++            prebuildChanged.wait(lock, [this, thread]() {
++                return prebuildStop || (prebuildRoundNext < prebuildRound.size()) ||
++                    (!prebuildAhead.empty() && ((thread == 0) || ((thread < prebuildBootThreads) && prebuildBoot[prebuildAhead.front()])));
++            });
++
++            if (prebuildStop) {
++                break;
++            }
++
++            const bool inRound = (prebuildRoundNext < prebuildRound.size());
++            uint32_t index;
++            if (inRound) {
++                index = prebuildRound[prebuildRoundNext++];
++                prebuildRoundSizeStarted += roundSize(index, dualSource);
++            }
++            else {
++                index = prebuildAhead.front();
++                prebuildAhead.pop_front();
++                if (prebuildState[index] == PrebuildTaken) {
++                    continue;
++                }
++
++                prebuildState[index] = PrebuildTaken;
++            }
++
++            lock.unlock();
++
++            ShaderDescription desc = (index < RT64PrebuiltShaderCount) ? prebuiltDescription(RT64PrebuiltShaderList[index]) : prebuildLearned[index - RT64PrebuiltShaderCount];
++            std::unique_ptr<RasterShader> shader;
++            const bool decalStencil = (RenderTarget::depthBufferFormat() == RenderFormat::D32_FLOAT_S8_UINT);
++            if ((index < RT64PrebuiltShaderCount) && (decalStencil || !RasterShader::prebuiltDecalStencil(desc))) {
++                const RT64PrebuiltShader &entry = RT64PrebuiltShaderList[index];
++                const char *text = prebuildText.data();
++                const uint32_t pixelOffset = dualSource ? entry.pixelOffset : entry.pixelSingleOffset;
++                shader = std::make_unique<RasterShader>(device, desc, shaderUber->pipelineLayout.get(), multisampling,
++                    text + entry.vertexOffset, entry.vertexSize, text + pixelOffset, prebuiltPixelSize(entry, dualSource));
++            }
++            else {
++                shader = std::make_unique<RasterShader>(device, desc, shaderUber->pipelineLayout.get(), shaderFormat, multisampling,
++                    shaderCompiler.get(), &optimizerCacheSPIRV, &shaderCacheWGSL);
++            }
++
++            {
++                const std::shared_ptr<RasterShader> built = std::move(shader);
++                const std::unique_lock<std::mutex> shadersLock(GPUShadersMutex);
++                GPUShaders[desc.hash()] = built;
++                if (index < RT64PrebuiltShaderCount) {
++                    for (uint64_t alias : prebuildAliases[index]) {
++                        GPUShaders[alias] = built;
++                    }
++                }
++            }
++
++            lock.lock();
++            if (inRound) {
++                prebuildRoundDone++;
++                prebuildRoundSizeDone += roundSize(index, dualSource);
++                reportPrebuild(prebuildRoundDone, uint32_t(prebuildRound.size()), prebuildRoundSizeDone, prebuildRoundSizeStarted, prebuildRoundSize);
++                if (prebuildRoundDone == prebuildRound.size()) {
++                    prebuildRoundHeld = false;
++                    printf("RT64: %u prebuilt shaders built in %.1f s, the game waiting\n", uint32_t(prebuildRound.size()), prebuildTimer.elapsedSeconds());
++                }
++            }
++
++            if (++prebuildBuilt == prebuildCount) {
++                prebuildText = std::string();
++                printf("RT64: all %u prebuilt shaders built\n", prebuildCount);
++            }
++
++            prebuildChanged.notify_all();
++        }
++#   endif
++    }
++
++    // Before each frame: holds it until the round is built, and then, if the last frame wanted prebuilt shaders,
++    // decides what builds them (startPrebuild() says how). Returns whether the game was held.
++    bool RasterShaderCache::waitForPrebuild() {
++        bool held = false;
++#   if defined(RT64_PREBUILT_SHADERS)
++        // Until something has drawn, no WebGPU layout has been resolved for the prebuilt shaders to be built for.
++        if (!prebuildDrawn) {
++            return false;
++        }
++
++        std::unique_lock<std::mutex> lock(prebuildMutex);
++        while (true) {
++            held = held || prebuildRoundHeld;
++            prebuildChanged.wait(lock, [this]() { return !prebuildRoundHeld; });
++            if (prebuildWanted.empty()) {
++                break;
++            }
++
++            uint32_t bestSection = UINT32_MAX;
++            uint32_t bestCount = 0;
++            for (uint32_t s = 0; s < RT64PrebuiltShaderSectionCount; s++) {
++                uint32_t count = 0;
++                for (uint32_t index : prebuildSections[s]) {
++                    count += (prebuildState[index] == PrebuildWanted) ? 1 : 0;
++                }
++
++                if (count > bestCount) {
++                    bestSection = s;
++                    bestCount = count;
++                }
++            }
++
++            if (bestCount >= PrebuildSectionMinimum) {
++                startPrebuildRound(bestSection, lock);
++            }
++            else if (!specializedShaders) {
++                startPrebuildRound(UINT32_MAX, lock);
++            }
++            else {
++                for (uint32_t index : prebuildWanted) {
++                    if (prebuildState[index] == PrebuildWanted) {
++                        prebuildState[index] = PrebuildSoon;
++                        prebuildAhead.emplace_front(index);
++                    }
++                }
++
++                prebuildWanted.clear();
++                prebuildChanged.notify_all();
++            }
++        }
++
++        lock.unlock();
++        held = buildMissed() || held;
++#   endif
++        return held;
++    }
++
++    // A draw asked for a prebuilt shader that isn't built yet.
++    void RasterShaderCache::wantPrebuild(uint64_t shaderHash) {
++        std::unique_lock<std::mutex> lock(prebuildMutex);
++        auto indexIt = prebuildIndices.find(shaderHash);
++        if ((indexIt != prebuildIndices.end()) && (prebuildState[indexIt->second] == PrebuildQueued)) {
++            prebuildState[indexIt->second] = PrebuildWanted;
++            prebuildWanted.emplace_back(indexIt->second);
+         }
+     }
+ 
+@@ -187,6 +709,12 @@ namespace RT64 {
+     }
+ 
+     void RasterShaderCache::submit(const ShaderDescription &desc) {
++        // A browser that builds no shaders behind the game (Firefox) still learns the ones the list missed, builds them
++        // before the next frame (buildMissed()), and with their section on the next visit.
++        if (!specializedShaders && !recordShaders && (prebuildCount == 0)) {
++            return;
++        }
++
+         {
+             std::unique_lock<std::mutex> queueLock(submissionMutex);
+ 
+@@ -239,6 +767,28 @@ namespace RT64 {
+             }
+         }
+ 
++        // The spec constants' order: other mode L and H, color combiner L and H, flags.
++        if (recordShaders) {
++            printf("rt64 shader: %08x %08x %08x %08x %08x\n", desc.otherMode.L, desc.otherMode.H, desc.colorCombiner.L, desc.colorCombiner.H, desc.flags.value);
++        }
++
++#   if defined(RT64_PREBUILT_SHADERS)
++        // What the list has is marked submitted before anything draws (startPrebuild()), so the list missed this one.
++        if (prebuildCount > 0) {
++            reportMissed(desc);
++        }
++#   endif
++
++        if (!specializedShaders) {
++#       if defined(RT64_PREBUILT_SHADERS)
++            if (prebuildCount > 0) {
++                const std::unique_lock<std::mutex> missedLock(missedMutex);
++                missedQueue.emplace_back(desc);
++            }
++#       endif
++            return;
++        }
++
+         // Push a new shader compilation to the queue.
+         {
+             const std::unique_lock<std::mutex> queueLock(descQueueMutex);
+@@ -248,6 +798,42 @@ namespace RT64 {
+         descQueueChanged.notify_all();
+     }
+     
++    // Where nothing is built during play (Firefox, setup()), a shader the list missed is built before the next frame,
++    // the game waiting, as a stray of the list is (startPrebuild()). Drawn with the ubershader instead, it stayed so
++    // for the rest of the visit: waiting for a moment when the game sends no frames found none in most of a long play,
++    // and the misses come where the list's sections have all been reached, with no section's wait after them. Each
++    // is built from the ubershader's WGSL with its spec constants as overrides, as a learned one is. Called by
++    // waitForPrebuild(), on the workload thread; returns whether the game waited.
++    bool RasterShaderCache::buildMissed() {
++        std::deque<ShaderDescription> missed;
++        {
++            const std::unique_lock<std::mutex> missedLock(missedMutex);
++            missed.swap(missedQueue);
++        }
++
++        if (missed.empty()) {
++            return false;
++        }
++
++        ElapsedTimer timer;
++        const uint32_t count = uint32_t(missed.size());
++        reportPrebuild(0, count, 0, 0, count);
++        for (uint32_t i = 0; i < count; i++) {
++            const ShaderDescription &desc = missed[i];
++            const std::shared_ptr<RasterShader> shader = std::make_shared<RasterShader>(device, desc, shaderUber->pipelineLayout.get(), shaderFormat,
++                multisampling, shaderCompiler.get(), &optimizerCacheSPIRV, &shaderCacheWGSL);
++            {
++                const std::unique_lock<std::mutex> shadersLock(GPUShadersMutex);
++                GPUShaders[desc.hash()] = shader;
++            }
++
++            reportPrebuild(i + 1, count, i + 1, i + 1, count);
++        }
++
++        printf("RT64: %u shaders the list missed built in %.1f s, the game waiting\n", count, timer.elapsedSeconds());
++        return true;
++    }
++
+     void RasterShaderCache::waitForAll() {
+         {
+             std::unique_lock<std::mutex> queueLock(descQueueMutex);
+@@ -279,6 +865,18 @@ namespace RT64 {
+         const std::unique_lock<std::mutex> lock(GPUShadersMutex);
+         auto shaderIt = GPUShaders.find(shaderHash);
+         if (shaderIt == GPUShaders.end()) {
++            // The first draw starts the prebuilt shaders' builds (startPrebuild()), and the page shows section 0's
++            // progress from there: nothing the launcher draws uses them.
++            if ((prebuildCount > 0) && !prebuildDrawn.exchange(true)) {
++                std::unique_lock<std::mutex> prebuildLock(prebuildMutex);
++                prebuildTimer.reset();
++                reportPrebuild(prebuildRoundDone, uint32_t(prebuildRound.size()), prebuildRoundSizeDone, prebuildRoundSizeStarted, prebuildRoundSize);
++            }
++
++            if (prebuildBuilt < prebuildCount) {
++                wantPrebuild(shaderHash);
++            }
++
+             return nullptr;
+         }
+ 
+diff --git b/src/render/rt64_raster_shader_cache.h a/src/render/rt64_raster_shader_cache.h
+index 5dc2663..fe22c29 100644
+--- b/src/render/rt64_raster_shader_cache.h
++++ a/src/render/rt64_raster_shader_cache.h
+@@ -4,15 +4,24 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <condition_variable>
++#include <deque>
+ #include <filesystem>
+ #include <fstream>
++#include <list>
++#include <map>
++#include <memory>
++#include <tuple>
++#include <string>
+ #include <mutex>
+ #include <queue>
+ #include <thread>
+ #include <unordered_map>
++#include <vector>
+ 
++#include "common/rt64_elapsed_timer.h"
+ #include "rt64_raster_shader.h"
+ 
+ namespace RT64 {
+@@ -30,13 +39,14 @@ namespace RT64 {
+         RenderDevice *device;
+         std::unique_ptr<RasterShaderUber> shaderUber;
+         OptimizerCacheSPIRV optimizerCacheSPIRV;
++        ShaderCacheWGSL shaderCacheWGSL;
+         std::mutex submissionMutex;
+         std::queue<ShaderDescription> descQueue;
+         std::mutex descQueueMutex;
+         int32_t descQueueActiveCount = 0;
+         std::condition_variable descQueueChanged;
+         std::unordered_map<uint64_t, bool> shaderHashes;
+-        std::unordered_map<uint64_t, std::unique_ptr<RasterShader>> GPUShaders;
++        std::unordered_map<uint64_t, std::shared_ptr<RasterShader>> GPUShaders;
+         std::mutex GPUShadersMutex;
+         std::list<std::unique_ptr<CompilationThread>> compilationThreads;
+         uint32_t threadCount;
+@@ -58,6 +68,47 @@ namespace RT64 {
+         // pipeline creation contending with the driver's submission path).
+         std::filesystem::path seenListPath;
+         bool replayingSeenList = false;
++        bool specializedShaders = true;
++        bool prebuiltShaders = false;
++        bool recordShaders = false;
++
++        // The shaders specialized when the program was built, in sections (startPrebuild()): a round builds the
++        // shaders a frame needs with the game waiting, and the rest are built ahead of it (prebuildAhead), the
++        // section the game is in first. The ones the list missed on an
++        // earlier visit are learned (learnPrebuild()), and descriptions that make the same pipeline share one built
++        // for the first of them (prebuildAliases).
++        std::list<std::thread> prebuildThreads;
++        std::mutex prebuildMutex;
++        std::condition_variable prebuildChanged;
++        bool prebuildStop = false;
++        uint32_t prebuildCount = 0;
++        std::atomic<uint32_t> prebuildBuilt = 0;
++        enum : uint8_t { PrebuildQueued, PrebuildWanted, PrebuildSoon, PrebuildTaken };
++        std::vector<uint8_t> prebuildState;
++        std::vector<uint32_t> prebuildWanted;
++        std::unordered_map<uint64_t, uint32_t> prebuildIndices;
++        std::vector<uint32_t> prebuildRound;
++        uint32_t prebuildRoundNext = 0;
++        uint32_t prebuildRoundDone = 0;
++        bool prebuildRoundHeld = false;
++        uint64_t prebuildRoundSize = 0;
++        uint64_t prebuildRoundSizeDone = 0;
++        uint64_t prebuildRoundSizeStarted = 0;
++        std::deque<uint32_t> prebuildAhead;
++        std::vector<bool> prebuildBoot;
++        uint32_t prebuildBootThreads = 1;
++        std::atomic<bool> prebuildDrawn = false;
++        std::string prebuildText;
++        ElapsedTimer prebuildTimer;
++        std::vector<ShaderDescription> prebuildLearned;
++        std::vector<std::vector<uint32_t>> prebuildLearnedSections;
++        std::vector<std::vector<uint32_t>> prebuildSections;
++        std::vector<std::vector<uint64_t>> prebuildAliases;
++        std::atomic<uint32_t> prebuildSection = 0;
++
++        // What the list missed where nothing is built during play (Firefox), built before the next frame (buildMissed()).
++        std::deque<ShaderDescription> missedQueue;
++        std::mutex missedMutex;
+ 
+         RasterShaderCache(uint32_t threadCount, uint32_t ubershaderThreadCount);
+         ~RasterShaderCache();
+@@ -66,6 +117,15 @@ namespace RT64 {
+         void openSeenList(const std::filesystem::path &path);
+         void submit(const ShaderDescription &desc);
+         void waitForAll();
++        void startPrebuild();
++        void startPrebuildRound(uint32_t section, std::unique_lock<std::mutex> &lock);
++        void prebuildLoop(uint32_t thread);
++        void wantPrebuild(uint64_t shaderHash);
++        void reportPrebuild(uint32_t done, uint32_t count, uint64_t sizeDone, uint64_t sizeStarted, uint64_t size);
++        bool waitForPrebuild();
++        void learnPrebuild();
++        void reportMissed(const ShaderDescription &desc);
++        bool buildMissed();
+         void destroyAll();
+         RasterShader *getGPUShader(const ShaderDescription &desc);
+         RasterShaderUber *getGPUShaderUber() const;
+diff --git b/src/shaders/RasterPS.hlsl a/src/shaders/RasterPS.hlsl
+index 8f612b9..96c23b4 100644
+--- b/src/shaders/RasterPS.hlsl
++++ a/src/shaders/RasterPS.hlsl
+@@ -45,9 +45,79 @@ float sampleBackgroundDepth(int2 pixelPos, uint sampleCount) {
+ }
+ #endif
+ 
++#if defined(DECAL_DEPTH_BOUNDS)
++// A decal's pixel shader on WebGPU, prebuilt: it reads no depth, so a decal draws in the pass that writes depth. A pass
++// can read the depth it draws to only if it writes none, and RT64 elsewhere ends the pass for each decal that follows
++// a draw that wrote depth and begins it again after: Banjo-Tooie ~25 times a frame, each pass ~70 us of Firefox's GPU
++// process. The decal check, |pixel - surface| <= max(CoplanarDepthTolerance(surface), dz), is two depth tests against
++// the surface's depth instead, in two draws with the stencil between them (RasterShader::createPipeline()): the first
++// writes the highest surface depth that passes (greater-equal; RasterParams' padding0 is 1 for it) and marks the
++// pixels, the second the lowest (less-equal), drawn where a mark is, which it takes back.
++static float decalDepth = 0.0f;
++
++// CoplanarDepthTolerance() is the same over each band of FloatToFixedDepth()'s exponent (0, 1, 2, 3 and more), so a
++// side's bound is the farthest one of the bands gives. Two depth tests pass one interval, and the check can pass two
++// pieces: within 0.0005 of where a band starts, a surface in the band below passes with its wider tolerance
++// while one in the pixel's own band just past its narrower one doesn't, and the interval draws there too.
++float decalDepthBound(float pixelDepth, float dz, bool high) {
++    // Where the exponent becomes 1, 2 and 3: FloatToFixedDepth() rounds, so half a step below 0x20000, 0x30000, 0x38000.
++    const float bandStart[4] = { 0.0f, 131071.5f / 262143.0f, 196607.5f / 262143.0f, 229375.5f / 262143.0f };
++    float bound = high ? (pixelDepth + dz) : (pixelDepth - dz);
++    for (uint e = 0; e < 4; e++) {
++        const float tolerance = 0.0005f / float(1U << e);
++        const float start = bandStart[e];
++        const float end = (e < 3) ? bandStart[e + 1] : 2.0f;
++        if (high && (pixelDepth + tolerance >= start)) {
++            // The band's surface depths up to the pixel's plus its tolerance: the last one below the next band at most.
++            bound = max(bound, min(pixelDepth + tolerance, asfloat(asuint(end) - 1U)));
++        }
++        else if (!high && (pixelDepth - tolerance < end)) {
++            bound = min(bound, max(pixelDepth - tolerance, start));
++        }
++    }
++
++    return bound;
++}
++#endif
++
++#if defined(WEBGPU) && defined(PER_DRAW_TEXTURES)
++// Samples texture 0 or 1 (t) as the two blocks below RasterPS's #else do. With mip LOD the tiles are picked per pixel,
++// so each tile's texture slot is a switch anyway (TextureSampler.hlsli), and RasterPS samples both in a loop the shader
++// keeps, which leaves sampleTexture() in it once: most of a prebuilt pixel shader with mip LOD. Without LOD a specialized
++// shader knows each tile's slot and clamp modes only if it samples them apart, as two calls (one of Majora's Mask's
++// with two tiles is 10 KB of WGSL that way, 60 in the loop). The ubershader always loops, and so does the spec constant
++// shader the browser specializes (SPEC_CONSTANT_LOOPS). Firefox 158 builds a section's pipelines one at a time while
++// the game waits, and in a test page built GoldenEye's Dam in 5.8-8.3 s against 14.8-19.1, Pilotwings 64's menus in
++// 5.7-8.2 against 13.9-16.3 and Conker's Windy in 4.1-4.4 against 6.3-8.4 (RTX 2070, three runs each, interleaved, a
++// busy host).
++float4 sampleDrawTile(uint t, OtherMode otherMode, RenderFlags flags, int tileIndex0, int tileIndex1, float2 lowResUV, float2 highResUV, float2 ddxUV, float2 ddyUV) {
++    const bool oneCycleHardwareBug = (otherMode.cycleType() == G_CYC_1CYCLE);
++    const bool firstTile = (t == 0) || oneCycleHardwareBug;
++    const uint tileIndex = firstTile ? tileIndex0 : tileIndex1;
++    const uint globalTileIndex = instanceRenderIndices[gConstants.renderIndex].rdpTileIndex + tileIndex;
++    RDPTile rdpTile = RDPTiles[globalTileIndex];
++    if (!renderFlagDynamicTiles(flags)) {
++        rdpTile.cms = firstTile ? renderCMS0(flags) : renderCMS1(flags);
++        rdpTile.cmt = firstTile ? renderCMT0(flags) : renderCMT1(flags);
++        rdpTile.nativeSampler = firstTile ? renderFlagNativeSampler0(flags) : renderFlagNativeSampler1(flags);
++    }
++
++    const GPUTile gpuTile = drawGPUTile(instanceRenderIndices[gConstants.renderIndex].rdpTileIndex, tileIndex);
++    const float2 textureUV = gpuTileFlagHighRes(gpuTile.flags) ? highResUV : lowResUV;
++    return sampleTexture(otherMode, flags, textureUV, ddxUV, ddyUV, rdpTile, gpuTile, (t == 1) && oneCycleHardwareBug);
++}
++#endif
++
+ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float2 vertexUV, float4 vertexSmoothColor, float4 vertexFlatColor,
+     bool isFrontFace, out float4 resultColor, out float4 resultAlpha, out float resultDepth) 
+ {
++    // Derivatives first, while every pixel of the quad is still running: they are undefined after a pixel returns, and
++    // WGSL refuses them in control flow that can differ between pixels.
++    const float ddxDepth = ddx(vertexPosition.z);
++    const float ddyDepth = ddy(vertexPosition.z);
++    float2 ddxVertexUV = ddx(vertexUV);
++    float2 ddyVertexUV = ddy(vertexUV);
++
+     // Defined on every path out of here, including the ones that return false.
+     resultDepth = vertexPosition.z;
+ 
+@@ -104,37 +174,51 @@ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float
+     resultDepth = QuantizeDepthN64(fragDepth);
+ 
+     if (depthDecal) {
+-        // Sample the depth buffer for this pixel to compare for the decal check.
+-        int2 pixelPos = floor(vertexPosition.xy);
+-        uint sampleCount = 1U << renderFlagSampleCount(rp.flags);
+-        float surfaceDepth = sampleBackgroundDepth(pixelPos, sampleCount);
+-
+         // Calculate the decal depth tolerance based on the depth derivatives (or the prim dz value if prim depth source is enabled).
+         float dz;
+         if (zSourcePrim) {
+             dz = instanceRDPParams[instanceIndex].primDepth.y;
+         }
+         else {
+-            dz = (abs(ddx(vertexPosition.z)) + abs(ddy(vertexPosition.z))) * FbParams.resolutionScale.y;
++            dz = (abs(ddxDepth) + abs(ddyDepth)) * FbParams.resolutionScale.y;
+         }
+ 
++        const float pixelDepth = select(depthClampNear, max(fragDepth, 0.0f), fragDepth);
++#if defined(DECAL_DEPTH_BOUNDS)
++        // The depth tests do the check (decalDepthBound()).
++        decalDepth = decalDepthBound(pixelDepth, dz, gConstants.padding0 != 0);
++#else
++        // Sample the depth buffer for this pixel to compare for the decal check.
++        int2 pixelPos = floor(vertexPosition.xy);
++        uint sampleCount = 1U << renderFlagSampleCount(rp.flags);
++        float surfaceDepth = sampleBackgroundDepth(pixelPos, sampleCount);
++
+         // Perform the decal depth tolerance check.
+         const float DepthTolerance = max(CoplanarDepthTolerance(surfaceDepth), dz);
+-        const float pixelDepth = select(depthClampNear, max(fragDepth, 0.0f), fragDepth);
+         if (abs(pixelDepth - surfaceDepth) > DepthTolerance) {
+             return false;
+         }
++#endif
+     }
+     
+-    float2 ddxVertexUV = ddx(vertexUV);
+-    float2 ddyVertexUV = ddy(vertexUV);
+     float2 lowResUV = vertexUV;
+     if (!renderFlagUpscale2D(rp.flags)) {
+         float2 screenPos = floor(vertexPosition.xy);
+         screenPos.x += FbParams.horizontalMisalignment;
+         lowResUV -= fmod(screenPos.xy, FbParams.resolutionScale.yy) * float2(ddxVertexUV.x, ddyVertexUV.y);
+     }
+-    
++
++    // A high resolution tile is sampled at vertexUV, which on a rect drawn backwards (a negative dsdx or dtdy) runs
++    // one native pixel behind the texel the low resolution UV picks, so its last row or column samples outside the
++    // tile. With FLIPPED_RECT_HIGH_RES (RT64_FLIPPED_RECT_HIGH_RES, on with WGSL) each native pixel starts at the texel
++    // it shows instead.
++    float2 highResUV = vertexUV;
++#if defined(FLIPPED_RECT_HIGH_RES)
++    if (renderFlagRect(rp.flags) && !renderFlagUpscale2D(rp.flags)) {
++        highResUV -= min(float2(ddxVertexUV.x, ddyVertexUV.y), 0.0f) * FbParams.resolutionScale.yy;
++    }
++#endif
++
+     int tileIndex0 = 0;
+     int tileIndex1 = 1;
+     float lodFraction;
+@@ -147,6 +231,40 @@ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float
+ 
+     float4 texVal0 = float4(0.0f, 0.0f, 0.0f, 1.0f);
+     float4 texVal1 = float4(0.0f, 0.0f, 0.0f, 1.0f);
++#if defined(WEBGPU) && defined(PER_DRAW_TEXTURES)
++    // The tiles in a loop or apart: sampleDrawTile() says when.
++    const bool usesTexture0 = renderFlagUsesTexture0(rp.flags);
++    const bool usesTexture1 = renderFlagUsesTexture1(rp.flags);
++    const bool loopTiles = usesTexture0 && usesTexture1 && (otherMode.textLOD() == G_TL_LOD);
++#if !defined(DYNAMIC_RENDER_PARAMS) && !defined(SPEC_CONSTANT_LOOPS)
++    if (!loopTiles) {
++        if (usesTexture0) {
++            texVal0 = sampleDrawTile(0, otherMode, rp.flags, tileIndex0, tileIndex1, lowResUV, highResUV, ddxVertexUV, ddyVertexUV);
++        }
++
++        if (usesTexture1) {
++            texVal1 = sampleDrawTile(1, otherMode, rp.flags, tileIndex0, tileIndex1, lowResUV, highResUV, ddxVertexUV, ddyVertexUV);
++        }
++    }
++    else
++#endif
++    {
++        [loop]
++        for (uint t = 0; t < 2; t++) {
++            if (!((t == 0) ? usesTexture0 : usesTexture1)) {
++                continue;
++            }
++
++            const float4 texVal = sampleDrawTile(t, otherMode, rp.flags, tileIndex0, tileIndex1, lowResUV, highResUV, ddxVertexUV, ddyVertexUV);
++            if (t == 0) {
++                texVal0 = texVal;
++            }
++            else {
++                texVal1 = texVal;
++            }
++        }
++    }
++#else
+     if (renderFlagUsesTexture0(rp.flags)) {
+         const uint globalTileIndex = instanceRenderIndices[gConstants.renderIndex].rdpTileIndex + tileIndex0;
+         RDPTile rdpTile = RDPTiles[globalTileIndex];
+@@ -156,14 +274,15 @@ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float
+             rdpTile.nativeSampler = renderFlagNativeSampler0(rp.flags);
+         }
+         
+-        const GPUTile gpuTile = GPUTiles[globalTileIndex];
+-        const float2 textureUV = gpuTileFlagHighRes(gpuTile.flags) ? vertexUV : lowResUV;
++        const GPUTile gpuTile = drawGPUTile(instanceRenderIndices[gConstants.renderIndex].rdpTileIndex, tileIndex0);
++        const float2 textureUV = gpuTileFlagHighRes(gpuTile.flags) ? highResUV : lowResUV;
+         texVal0 = sampleTexture(otherMode, rp.flags, textureUV, ddxVertexUV, ddyVertexUV, rdpTile, gpuTile, false);
+     }
+     
+     if (renderFlagUsesTexture1(rp.flags)) {
+         const bool oneCycleHardwareBug = (otherMode.cycleType() == G_CYC_1CYCLE);
+-        const uint globalTileIndex = instanceRenderIndices[gConstants.renderIndex].rdpTileIndex + (oneCycleHardwareBug ? tileIndex0 : tileIndex1);
++        const uint tileIndex = oneCycleHardwareBug ? tileIndex0 : tileIndex1;
++        const uint globalTileIndex = instanceRenderIndices[gConstants.renderIndex].rdpTileIndex + tileIndex;
+         RDPTile rdpTile = RDPTiles[globalTileIndex];
+         if (!renderFlagDynamicTiles(rp.flags)) {
+             rdpTile.cms = oneCycleHardwareBug ? renderCMS0(rp.flags) : renderCMS1(rp.flags);
+@@ -171,12 +290,13 @@ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float
+             rdpTile.nativeSampler = oneCycleHardwareBug ? renderFlagNativeSampler0(rp.flags) : renderFlagNativeSampler1(rp.flags);
+         }
+         
+-        const GPUTile gpuTile = GPUTiles[globalTileIndex];
+-        const float2 textureUV = gpuTileFlagHighRes(gpuTile.flags) ? vertexUV : lowResUV;
++        const GPUTile gpuTile = drawGPUTile(instanceRenderIndices[gConstants.renderIndex].rdpTileIndex, tileIndex);
++        const float2 textureUV = gpuTileFlagHighRes(gpuTile.flags) ? highResUV : lowResUV;
+         const uint nativeSampler = renderFlagNativeSampler1(rp.flags);
+         texVal1 = sampleTexture(otherMode, rp.flags, textureUV, ddxVertexUV, ddyVertexUV, rdpTile, gpuTile, oneCycleHardwareBug);
+     }
+-    
++#endif
++
+     // Color combiner.
+     float4 shadeColor = vertexColor;
+     float4 combinerColor;
+@@ -287,6 +407,14 @@ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float
+         resultColor.a = resultCvg;
+     }
+     
++#if defined(WEBGPU) && !defined(DUAL_SOURCE_BLENDING)
++    // Without dual-source blending, which WebGPU leaves optional, an alpha-blended draw blends by the alpha of its one
++    // output, so the blend factor takes the coverage's place there.
++    if (alphaBlend) {
++        resultColor.a = resultAlpha.a;
++    }
++#endif
++
+     // Add highlight color to the last step.
+     uint highlightColorUint = instanceRenderIndices[gConstants.renderIndex].highlightColor;
+     if (highlightColorUint > 0) {
+@@ -325,9 +453,17 @@ void PSMain(
+ #if defined(DYNAMIC_RENDER_PARAMS)
+     , bool isFrontFace : SV_IsFrontFace
+ #endif
++#if defined(WEBGPU) && !defined(DUAL_SOURCE_BLENDING)
++    , [[vk::location(0)]] out float4 pixelColor : SV_TARGET0
++#else
+     , [[vk::location(0)]] [[vk::index(0)]] out float4 pixelColor : SV_TARGET0
+     , [[vk::location(0)]] [[vk::index(1)]] out float4 pixelAlpha : SV_TARGET1
++#endif
++#if defined(DECAL_DEPTH_BOUNDS)
++    , out float pixelDepth : SV_Depth
++#else
+     , out float pixelDepth : SV_DepthGreaterEqual
++#endif
+ )
+ {
+ #if !defined(DYNAMIC_RENDER_PARAMS)
+@@ -344,7 +480,14 @@ void PSMain(
+     }
+ 
+     pixelColor = resultColor;
++#if defined(DECAL_DEPTH_BOUNDS)
++    pixelDepth = decalDepth;
++#endif
++#if !defined(WEBGPU) || defined(DUAL_SOURCE_BLENDING)
+     pixelAlpha = resultAlpha;
++#endif
++#if !defined(DECAL_DEPTH_BOUNDS)
+     pixelDepth = resultDepth;
++#endif
+ }
+ #endif
+\ No newline at end of file
+diff --git b/src/shaders/TextureDecodeCS.hlsl a/src/shaders/TextureDecodeCS.hlsl
+index ca58e40..ab6c588 100644
+--- b/src/shaders/TextureDecodeCS.hlsl
++++ a/src/shaders/TextureDecodeCS.hlsl
+@@ -3,6 +3,7 @@
+ //
+ 
+ #include "TextureDecoder.hlsli"
++#include "WebGPU.hlsli"
+ 
+ #define GROUP_SIZE 8
+ 
+@@ -21,7 +22,7 @@ Texture1D<uint> TMEM : register(t1);
+ // Pokemon Snap port: the texture is always R8G8B8A8_UNORM (rt64_texture_cache.cpp);
+ // said here so the SPIR-V declares that format instead of the rgba32f DXC
+ // infers from float4, which the validation layer reports as a mismatch.
+-[[vk::image_format("rgba8")]] RWTexture2D<float4> RGBA32 : register(u2);
++IMAGE_FORMAT("rgba8") RWTexture2D<float4> RGBA32 : register(u2);
+ 
+ [numthreads(GROUP_SIZE, GROUP_SIZE, 1)]
+ void CSMain(uint2 coord : SV_DispatchThreadID) {
+diff --git b/src/shared/rt64_rdp_params.h a/src/shared/rt64_rdp_params.h
+index 795315c..3e4a016 100644
+--- b/src/shared/rt64_rdp_params.h
++++ a/src/shared/rt64_rdp_params.h
+@@ -16,9 +16,14 @@ namespace interop {
+         float4 envColor;
+         float4 fogColor;
+         float4 blendColor;
++        // Every float3 starts on 16 bytes and the struct is a multiple of 16 long, so the D3D packing dxc gives a
++        // StructuredBuffer (-fvk-use-dx-layout) is also the layout WGSL gives a storage buffer (vec3 aligns to 16).
+         float3 keyCenter;
++        float keyCenterPad;
+         float3 keyScale;
++        float keyScalePad;
+         int convertK[6];
++        int convertKPad[2];
+         // Pokemon Snap port: when snapPrimBlend is set, the primitive colour
+         // this call had in the previous matched frame; the raster shader
+         // blends from it to primColor by the sub-frame's weight
+@@ -29,6 +34,9 @@ namespace interop {
+         float snapPrimPad1;
+         float snapPrimPad2;
+     };
++#ifdef HLSL_CPU
++    static_assert(sizeof(RDPParams) == 176, "RDPParams must keep the layout WGSL gives it.");
++#endif
+ #ifdef HLSL_CPU
+ };
+ #endif
+\ No newline at end of file

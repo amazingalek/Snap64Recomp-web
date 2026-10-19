@@ -185,7 +185,12 @@ static ultramodern::renderer::WindowHandle create_window(void* /*gfx_data*/) {
     if (snap::settings().window_maximized && (getenv("SNAP_WINDOW") == nullptr) && !snap::in_gamescope()) {
         windowFlags |= SDL_WINDOW_MAXIMIZED;
     }
-#if defined(__APPLE__)
+#if defined(__EMSCRIPTEN__)
+    // On a page the window is the canvas, which the page sizes in CSS pixels
+    // and SDL follows; RT64 draws on it with WebGPU. At the device's pixels
+    // a laptop's 2x scale would draw four times as many.
+    windowFlags = SDL_WINDOW_RESIZABLE;
+#elif defined(__APPLE__)
     // RT64 draws with Metal on a Mac; the layer is taken from SDL below.
     windowFlags |= SDL_WINDOW_METAL;
 #else

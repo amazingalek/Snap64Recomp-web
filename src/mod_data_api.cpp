@@ -35,6 +35,10 @@
 #include "librecomp/overlays.hpp"
 #include "ultramodern/error_handling.hpp"
 
+#if defined(__EMSCRIPTEN__)
+// Emscripten's <limits.h> defines PAGESIZE, which slot_map.h names a template parameter.
+#undef PAGESIZE
+#endif
 #include "slot_map.h"
 
 #include "mod_api.h"

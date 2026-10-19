@@ -10,6 +10,22 @@
 
 # Snap64 Recomp
 
+> [!WARNING]
+> **This is amazingalek/Snap64Recomp-web, a fork, not Snap64 Recomp.** Its `main` branch is upstream's built into a
+> web page (WebGPU, through [N64Recomp-browser](https://github.com/amazingalek/N64Recomp-browser)), and everything on
+> it past upstream's commits was written by AI (Claude). It is not made, endorsed or supported by upstream's authors,
+> nothing here is offered upstream, and please don't take issues with this fork to them. Building the page:
+> [docs/WEB.md](docs/WEB.md).
+>
+> This port is here to build out and test N64Recomp-browser's web support on another game than the one it was written
+> for: what it turns up is fixed there where it can be, so every recomp's page gets the fix.
+
+**Play it in the browser: https://amazingalek.github.io/Snap64Recomp-web/**, with your own dump of Pokémon Snap (US),
+picked on the page and kept in the browser. It needs WebGPU (Chrome or Edge 113 and up, or Firefox). The page is the
+game with the port's menus and settings, without mods; the save, the Snap Station's sheets and exported photos stay
+in the browser's storage (docs/WEB.md says why). It is built from this branch and published with N64Recomp-browser's
+`tools/publish_page.sh`, so it can be a commit or two behind.
+
 Snap64 Recomp is a native PC port of Pokémon Snap (Nintendo 64, US release)
 for Windows, Linux, the Steam Deck and macOS. It is made with
 [N64: Recompiled](https://github.com/N64Recomp/N64Recomp), which translates
