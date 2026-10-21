@@ -24,9 +24,10 @@ the MIPS binutils, Python 3 with venv and, for faster rebuilds, ccache on `PATH`
 
 1. The submodules, with N64Recomp-browser's web patches on them (`lib/N64Recomp-browser/patches/apply.cmake`, project
    by project), but for the files where this port's own changes to rt64 and the runtime meet the web's: the web's
-   change to those is `patches/web/<project>.patch`, written on top of the port's. `tools/check_web_patches.sh`
-   stops the build when N64Recomp-browser's change to one of those files (`patches/web/files.txt`) has moved since
-   that patch was merged, so a page never goes quietly without it.
+   change to those is `patches/web/<project>.patch`, written on top of the port's from the N64Recomp-browser commit
+   `patches/web/files.txt` names. What the web has changed in those files since is merged in by its `apply.cmake
+   --since`, so a page never goes without it, and only a change that meets the port's own lines stops the build, to
+   be merged into the patch by hand (`files.txt` says how).
 2. N64Recomp and RSPRecomp, built natively from the patched checkout: its `funcs.h` declares every function the
    recompiled code calls, which a WebAssembly link needs.
 3. The decompilation's ELF, relinked with its relocations as BUILDING.md says and checked against the ROM.
