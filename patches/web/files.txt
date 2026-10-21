@@ -2,7 +2,7 @@
 # patches/web/<project>.patch, merged by hand with Snap64 Recomp's from the N64Recomp-browser commit below. The build
 # merges in what the web has changed in them since (apply.cmake --since), and stops only where that meets the port's
 # own lines: then merge it into patches/web/<project>.patch by hand and move the commit below to the one merged from.
-# merged from N64Recomp-browser b550d6e4d41d20689bac42728b71981e7083b8b3
+# merged from N64Recomp-browser 665f46d17912e917ea07ccde0c9f885780d69d4c
 rt64 CMakeLists.txt
 rt64 src/hle/rt64_game_frame.cpp
 rt64 src/hle/rt64_game_frame.h
@@ -17,6 +17,7 @@ rt64 src/render/rt64_raster_shader.h
 rt64 src/render/rt64_raster_shader_cache.cpp
 rt64 src/render/rt64_raster_shader_cache.h
 rt64 src/shaders/RasterPS.hlsl
+rt64 src/shaders/RasterVS.hlsl
 rt64 src/shaders/TextureDecodeCS.hlsl
 rt64 src/shared/rt64_rdp_params.h
 N64ModernRuntime librecomp/src/mods.cpp

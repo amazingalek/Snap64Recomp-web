@@ -1,7 +1,7 @@
-diff --git b/librecomp/src/mods.cpp a/librecomp/src/mods.cpp
+diff --git a/librecomp/src/mods.cpp b/librecomp/src/mods.cpp
 index 037f15f..deb40e5 100644
---- b/librecomp/src/mods.cpp
-+++ a/librecomp/src/mods.cpp
+--- a/librecomp/src/mods.cpp
++++ b/librecomp/src/mods.cpp
 @@ -75,6 +75,9 @@ bool get_to_vec(const nlohmann::json& val, std::vector<T2>& out) {
  // MSVC/GCC/Clang ARM64
  #elif defined(__ARM_ARCH_ISA_A64)
@@ -376,11 +376,11 @@ index 037f15f..deb40e5 100644
      loaded_mods_by_id.clear();
      hook_slots.clear();
      processed_hook_slots.clear();
-diff --git b/ultramodern/CMakeLists.txt a/ultramodern/CMakeLists.txt
-index 59acf58..011b0c1 100644
---- b/ultramodern/CMakeLists.txt
-+++ a/ultramodern/CMakeLists.txt
-@@ -40,3 +40,16 @@ if (WIN32)
+diff --git a/ultramodern/CMakeLists.txt b/ultramodern/CMakeLists.txt
+index 59acf58..77e7d3a 100644
+--- a/ultramodern/CMakeLists.txt
++++ b/ultramodern/CMakeLists.txt
+@@ -40,3 +40,23 @@ if (WIN32)
  endif()
  
  
@@ -397,10 +397,17 @@ index 59acf58..011b0c1 100644
 +if (ULTRAMODERN_HOLD_BLOCKED_MESSAGES OR EMSCRIPTEN)
 +    target_compile_definitions(ultramodern PRIVATE ULTRAMODERN_HOLD_BLOCKED_MESSAGES=1)
 +endif()
-diff --git b/ultramodern/src/events.cpp a/ultramodern/src/events.cpp
++
++# A load from ROM onto display list commands the renderer may not have read yet waits until it has (src/displaylists.cpp).
++target_sources(ultramodern PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/displaylists.cpp")
++option(ULTRAMODERN_LOADS_WAIT_FOR_DISPLAY_LISTS "A load from ROM onto display list commands the renderer may not have read yet waits for it (always on with Emscripten)" OFF)
++if (ULTRAMODERN_LOADS_WAIT_FOR_DISPLAY_LISTS OR EMSCRIPTEN)
++    target_compile_definitions(ultramodern PRIVATE ULTRAMODERN_LOADS_WAIT_FOR_DISPLAY_LISTS=1)
++endif()
+diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
 index a2fc449..ae9ee82 100644
---- b/ultramodern/src/events.cpp
-+++ a/ultramodern/src/events.cpp
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
 @@ -182,6 +182,98 @@ uint64_t total_vis = 0;
  
  
@@ -526,10 +533,10 @@ index a2fc449..ae9ee82 100644
          if (new_total_vis > total_vis + 1) {
              //printf("Skipped % " PRId64 " frames in VI interupt thread!\n", new_total_vis - total_vis - 1);
          }
-diff --git b/ultramodern/src/mesgqueue.cpp a/ultramodern/src/mesgqueue.cpp
+diff --git a/ultramodern/src/mesgqueue.cpp b/ultramodern/src/mesgqueue.cpp
 index 45e1e87..74003ce 100644
---- b/ultramodern/src/mesgqueue.cpp
-+++ a/ultramodern/src/mesgqueue.cpp
+--- a/ultramodern/src/mesgqueue.cpp
++++ b/ultramodern/src/mesgqueue.cpp
 @@ -16,6 +16,14 @@ struct QueuedMessage {
      // Pokemon Snap port: a retrace or an audio tick, the messages the VI
      // thread posts on a clock. See dequeue_external_messages.
@@ -628,10 +635,10 @@ index 45e1e87..74003ce 100644
  
  extern "C" void osCreateMesgQueue(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg, s32 count) {
      OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
-diff --git b/ultramodern/src/threads.cpp a/ultramodern/src/threads.cpp
+diff --git a/ultramodern/src/threads.cpp b/ultramodern/src/threads.cpp
 index b2e375c..8fbc05f 100644
---- b/ultramodern/src/threads.cpp
-+++ a/ultramodern/src/threads.cpp
+--- a/ultramodern/src/threads.cpp
++++ b/ultramodern/src/threads.cpp
 @@ -280,6 +280,15 @@ void ultramodern::set_native_thread_priority(ThreadPriority pri) {
          fprintf(stderr, "[Thread] macOS refused the time-constraint policy for a pacing thread (%d); the game's pace may drift\n", int(result));
      }
@@ -711,10 +718,10 @@ index b2e375c..8fbc05f 100644
  }
  
  extern "C" void osDestroyThread(RDRAM_ARG PTR(OSThread) t_) {
-diff --git b/ultramodern/src/timer.cpp a/ultramodern/src/timer.cpp
+diff --git a/ultramodern/src/timer.cpp b/ultramodern/src/timer.cpp
 index 68a63d0..10d5c21 100644
---- b/ultramodern/src/timer.cpp
-+++ a/ultramodern/src/timer.cpp
+--- a/ultramodern/src/timer.cpp
++++ b/ultramodern/src/timer.cpp
 @@ -37,6 +37,38 @@ static uint32_t speed_den = 1;
  static uint64_t clock_base_ticks = 0;                                               // the counter at the last change
  static std::chrono::high_resolution_clock::time_point clock_base_time = start_time; // the instant of the last change
