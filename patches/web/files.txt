@@ -2,12 +2,17 @@
 # patches/web/<project>.patch, merged by hand with Snap64 Recomp's from the N64Recomp-browser commit below. The build
 # merges in what the web has changed in them since (apply.cmake --since), and stops only where that meets the port's
 # own lines: then merge it into patches/web/<project>.patch by hand and move the commit below to the one merged from.
-# merged from N64Recomp-browser 808ed61d95218d2fdf0bd726090578e952051d80
+# merged from N64Recomp-browser ca718185d3daf009cd256c915c1b0791237ef2e3
 rt64 CMakeLists.txt
+rt64 src/hle/rt64_framebuffer_manager.cpp
+rt64 src/hle/rt64_framebuffer_manager.h
+rt64 src/hle/rt64_framebuffer_pair.cpp
 rt64 src/hle/rt64_game_frame.cpp
 rt64 src/hle/rt64_game_frame.h
 rt64 src/hle/rt64_present_queue.cpp
 rt64 src/hle/rt64_present_queue.h
+rt64 src/hle/rt64_rdp.cpp
+rt64 src/hle/rt64_rsp.cpp
 rt64 src/hle/rt64_state.cpp
 rt64 src/hle/rt64_state.h
 rt64 src/hle/rt64_vi.cpp
