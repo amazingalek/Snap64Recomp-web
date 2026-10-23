@@ -599,7 +599,7 @@ index b1c72b1..d400fee 100644
          uint64_t hashFromCall(const GameCall &call, uint32_t matrixIdHash) const;
          bool isDebuggerCameraEnabled(const WorkloadQueue &workloadQueue);
 diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
-index d2b8116..98d3167 100644
+index d2b8116..b75ffd6 100644
 --- a/src/hle/rt64_present_queue.cpp
 +++ b/src/hle/rt64_present_queue.cpp
 @@ -7,6 +7,10 @@
@@ -691,7 +691,7 @@ index d2b8116..98d3167 100644
              if (lockedWorkloadMutex) {
                  ext.sharedResources->workloadMutex.unlock();
                  lockedWorkloadMutex = false;
-@@ -989,17 +1019,57 @@ namespace {
+@@ -989,17 +1019,59 @@ namespace {
                      }
                  }
  
@@ -708,7 +708,9 @@ index d2b8116..98d3167 100644
 +                    // to the page's thread) isn't added to every period. In Chrome the pages of games below the
 +                    // display's rate presented every 18 ms, 55.6 a second, where those at its rate, which never sleep
 +                    // here, presented 60. A present a whole period past its slot or more starts the slots from itself.
-+                    // Where the swap chain learns of the display's frames as they come (WebGPU), the wait ends on one.
++                    // Where the swap chain learns of the display's frames as they come (WebGPU), it sleeps: until a
++                    // frame where timed waits end late, else until the slot, woken by the frames and spun from the last
++                    // (plume-web e16e003: this thread's 100 us sleeps in Chrome now and then took a tick).
 +                    const auto presentPeriod = std::chrono::nanoseconds(1'000'000'000 / targetRate);
 +                    if ((presentSlot == Timestamp()) || ((presentTimestamp - presentSlot) >= presentPeriod)) {
 +                        presentSlot = presentTimestamp;
@@ -749,7 +751,7 @@ index d2b8116..98d3167 100644
                  swapChainValid = ext.swapChain->present(swapChainIndex, &waitSemaphore, 1);
                  presentProfiler.logAndRestart();
  
-@@ -1297,6 +1367,194 @@ namespace {
+@@ -1297,6 +1369,194 @@ namespace {
          ext.sharedResources->interpolatedCondition.notify_all();
      }
  
@@ -944,7 +946,7 @@ index d2b8116..98d3167 100644
      void PresentQueue::notifyPresentId(const Present &present) {
          {
              std::scoped_lock<std::mutex> cursorLock(presentIdMutex);
-@@ -1331,8 +1589,10 @@ namespace {
+@@ -1331,8 +1591,10 @@ namespace {
          const bool displayTiming = ext.device->getCapabilities().displayTiming;
          bool swapChainValid = !ext.swapChain->needsResize();
          while (presentThreadRunning) {
@@ -955,7 +957,7 @@ index d2b8116..98d3167 100644
                  cursorCondition.wait(cursorLock, [&]() {
                      return (writeCursor != threadCursor) || !presentThreadRunning;
                  });
-@@ -1344,6 +1604,22 @@ namespace {
+@@ -1344,6 +1606,22 @@ namespace {
                  }
              }
  
@@ -978,7 +980,7 @@ index d2b8116..98d3167 100644
              if (processCursor >= 0) {
                  std::unique_lock<std::mutex> threadLock(threadMutex);
                  const bool needsResize = ext.swapChain->needsResize() || !swapChainValid;
-@@ -1391,13 +1667,26 @@ namespace {
+@@ -1391,13 +1669,26 @@ namespace {
  
                  skipPresent = skipPresent || ext.swapChain->isEmpty();
  
@@ -1070,10 +1072,62 @@ index 34bf666..f5113e8 100644
          void threadAdvanceBarrier();
          void threadLoop();
 diff --git a/src/hle/rt64_rsp.cpp b/src/hle/rt64_rsp.cpp
-index b317ab5..0058942 100644
+index b317ab5..0922dd3 100644
 --- a/src/hle/rt64_rsp.cpp
 +++ b/src/hle/rt64_rsp.cpp
-@@ -1287,6 +1287,14 @@ namespace RT64 {
+@@ -1261,25 +1261,41 @@ namespace RT64 {
+         // the picture with the camera pitched up at it, Snorlax on the Beach
+         // -- had an empty fitted box and was dropped whole by the selection
+         // gates (rt64_workload_queue.cpp), so it vanished until the camera
+-        // came back down. Such a triangle is taken as visible and as covering
+-        // the scissor: its extent is unknowable before clipping, and the
+-        // scissor is the bound the RDP draws against. Drawing itself is not
+-        // touched; the GPU clips the triangle as it always did.
++        // came back down. A triangle that straddles the plane is taken as
++        // visible and as covering the scissor: its extent is unknowable before
++        // clipping, and the scissor is the bound the RDP draws against. One
++        // with every vertex behind the plane is clipped whole and draws
++        // nothing, and one wholly in front has its box from its vertices held
++        // to 8192 pixels each way, past any framebuffer, and its winding
++        // judged only while they are within 4096 (a projective image keeps its
++        // winding, but the cross product of far-out vertices overflows).
++        // Taking every such triangle as covering the scissor made a pass whose
++        // triangles were all behind the camera or off one side a write of its
++        // whole framebuffer: Banjo-Kazooie's title made ~100 full-screen tile
++        // copies of one within a few seconds, each kept, 3.6 GB at 3840x2000.
++        // Drawing itself is not touched; the GPU clips the triangle as it
++        // always did.
++        int behindCount = 0;
+         bool unprojectable = false;
++        bool farOut = false;
+         for (int i = 0; i < 3; i++) {
+             const hlslpp::float4 &t = workload.drawData.posTransformed[globalIndices[i]];
+             const hlslpp::float3 &s = posScreen[globalIndices[i]];
+-            // 4096 pixels each way is far past any framebuffer; squared so a
+-            // NaN fails the test too.
+-            if ((t[3] <= 0.0f) || !(s[0] * s[0] < 16777216.0f) || !(s[1] * s[1] < 16777216.0f)) {
++            if (!(t[3] > 0.0f)) {
++                behindCount++;
++            }
++            else if ((s[0] != s[0]) || (s[1] != s[1])) {
+                 unprojectable = true;
+-                break;
++            }
++            else if (!(s[0] * s[0] < 16777216.0f) || !(s[1] * s[1] < 16777216.0f)) {
++                farOut = true;
+             }
+         }
+ 
+-        bool visibleTri = true;
++        unprojectable = unprojectable || ((behindCount > 0) && (behindCount < 3));
++        bool visibleTri = (behindCount < 3);
+         const bool usesCulling = geometryMode & cullBothMask;
+-        if (usesCulling && !unprojectable) {
++        if (usesCulling && visibleTri && !unprojectable && !farOut) {
+             const hlslpp::float3 U = posScreen[globalIndices[1]] - posScreen[globalIndices[0]];
+             const hlslpp::float3 V = posScreen[globalIndices[2]] - posScreen[globalIndices[0]];
+             const hlslpp::float3 N = hlslpp::cross(V, U);
+@@ -1287,6 +1303,14 @@ namespace RT64 {
          }
  
          const FixedRect &scissorRect = state->rdp->scissorRectStack[state->rdp->scissorStackSize - 1];
@@ -1087,6 +1141,23 @@ index b317ab5..0058942 100644
 +
          if (visibleTri && !scissorRect.isNull()) {
              fbPair.scissorRect.merge(scissorRect);
+ 
+@@ -1297,10 +1321,12 @@ namespace RT64 {
+             else {
+                 for (int i = 0; i < 3; i++) {
+                     const hlslpp::float3 &v = posScreen[globalIndices[i]];
+-                    drawRect.ulx = std::min(drawRect.ulx, int32_t(v[0] * 4.0f));
+-                    drawRect.uly = std::min(drawRect.uly, int32_t(v[1] * 4.0f));
+-                    drawRect.lrx = std::max(drawRect.lrx, int32_t(hlslpp::ceil(v.x).x * 4.0f));
+-                    drawRect.lry = std::max(drawRect.lry, int32_t(hlslpp::ceil(v.y).x * 4.0f));
++                    const float x = std::min(std::max(float(v[0]), -8192.0f), 8192.0f);
++                    const float y = std::min(std::max(float(v[1]), -8192.0f), 8192.0f);
++                    drawRect.ulx = std::min(drawRect.ulx, int32_t(x * 4.0f));
++                    drawRect.uly = std::min(drawRect.uly, int32_t(y * 4.0f));
++                    drawRect.lrx = std::max(drawRect.lrx, int32_t(hlslpp::ceil(hlslpp::float1(x)).x * 4.0f));
++                    drawRect.lry = std::max(drawRect.lry, int32_t(hlslpp::ceil(hlslpp::float1(y)).x * 4.0f));
+                 }
+             }
  
 diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
 index 6d41c9a..71932c8 100644
