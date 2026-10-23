@@ -26,7 +26,17 @@ struct Settings {
     // fullscreen window's own size changes are not the player's and leave
     // it alone. SNAP_WINDOW=WxH in the environment wins over it.
     bool  window_maximized  = false;
-    bool  widescreen        = false;  // RT64 Expand: a true wider FOV, the window's own shape, not a stretch
+    // RT64 Expand: a true wider FOV, the window's own shape, not a stretch.
+#if defined(__EMSCRIPTEN__)
+    // On a page, on: every web build of an N64 recomp opens widescreen, the
+    // canvas being whatever shape the browser's window is. A player can still
+    // turn it off in the menu. A page's file from before this
+    // default holds the false its first boot saved, which no player chose:
+    // read_settings_file turns that on once (web_widescreen_default).
+    bool  widescreen        = true;
+#else
+    bool  widescreen        = false;
+#endif
     int   msaa              = 0;      // 0, 2, 4, 8
     // 0 = Original (native rate), 1 = Display refresh, 2 = Manual.
     //

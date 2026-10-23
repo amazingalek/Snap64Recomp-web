@@ -50,6 +50,10 @@ Left Shift Z, Enter Start, E R, IJKL the C buttons; the mouse aims the camera on
 - **Frame rate Display** by default (`src/settings.h`): RT64 interpolates the game's frames to the display's rate, as
   every recomp's page does, and the resolution follows the canvas as the port's default does (the largest whole
   multiple of the game's 320x240 that fits). A player can still pick Original in the menu.
+- **Widescreen** by default (`src/settings.h`): a course is as wide as the canvas's own shape, as every recomp's page
+  opens. A player can still turn it off in the menu. A page's settings saved before that default hold the
+  Off its first boot wrote, which no player chose, so a file without the `web_widescreen_default` key a page now
+  writes opens widescreen once (`src/settings.cpp`).
 - **Render to RAM stays on, with the exact copy**: the game scores a photo from the frame it has just drawn, and the
   camera's focus dot is found in that same frame, so a copy a display list late would score the frame before
   (`src/settings.h`, `render_to_ram`).

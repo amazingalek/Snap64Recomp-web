@@ -696,7 +696,7 @@ the defaults below are that file's.
 | --- | --- | --- |
 | `fullscreen` | `false` | saved as set; the window opens windowed and goes fullscreen a moment later when the file says so (a window created fullscreen comes up with broken chrome), and the Snap Station's own relaunches return in the state the print started in |
 | `window_maximized` | `false` | the window was maximized when the port last saw it, and opens maximized; `SNAP_WINDOW=WxH` wins over it |
-| `widescreen` | `false` | RT64 Expand: a true wider field of view in a course, as wide as the window's own shape (16:9, 16:10, 21:9 or wider), not a stretch; the film counter sits against the picture's right edge and the R and Z icons slide out to it; the title, the lab and the other 4:3 screens sit in black bars. Pokémon and effect sprites at the edges are kept ([Known issues](KNOWN-ISSUES.md)) |
+| `widescreen` | `false` (`true` on a page, [WEB.md](WEB.md)) | RT64 Expand: a true wider field of view in a course, as wide as the window's own shape (16:9, 16:10, 21:9 or wider), not a stretch; the film counter sits against the picture's right edge and the R and Z icons slide out to it; the title, the lab and the other 4:3 screens sit in black bars. Pokémon and effect sprites at the edges are kept ([Known issues](KNOWN-ISSUES.md)) |
 | `msaa` | `0` | 0, 2, 4 or 8 |
 | `fps_mode` | `0` | 0 Original, 1 Display refresh, 2 Manual (`fps_manual_target`) |
 | `fps_manual_target` | `120` | the rate a number on the Frame Rate row holds; a value not on the row shows as the nearest of its eight and becomes it once the page is edited |

@@ -210,6 +210,16 @@ static SettingsRead read_settings_file(const std::filesystem::path& path, Settin
                            !j.contains("keys_help") || !j.contains("pad_layout") ||
                            !j.contains("pad_sticks_swapped") || !j.contains("pad_deadzone") ||
                            !j.contains("fast_forward_speed") || !j.contains("slow_motion_speed");
+#if defined(__EMSCRIPTEN__)
+        // Every page's first boot saved the whole file, its widescreen the
+        // false that was the default then, so a file without this key holds a
+        // false nobody chose: it opens widescreen as a new page does, once,
+        // and the rewrite carries the key, so a later Off stays off.
+        if (!j.contains("web_widescreen_default")) {
+            s.widescreen = true;
+            s_fields_missing = true;
+        }
+#endif
         out = s;
         return SettingsRead::Ok;
     } catch (const std::exception& e) {
@@ -353,7 +363,7 @@ bool save_settings() {
         {"unknown_names", "reported in snap64.log and skipped; an input left with nothing keeps its default"},
         {"not_bindable", "the sticks themselves: the left stick aims and the right stick works the C buttons"},
     };
-    const nlohmann::json j{
+    nlohmann::json j{
         {"fullscreen",            copy.fullscreen || s_boot_fullscreen_pending},
         {"window_maximized",      copy.window_maximized},
         {"widescreen",            copy.widescreen},
@@ -404,6 +414,11 @@ bool save_settings() {
         {"keys",                  keys},
         {"keys_help",             keys_help},
     };
+#if defined(__EMSCRIPTEN__)
+    // Written, never read for its value: read_settings_file's mark that the
+    // file's widescreen was saved by a page that opens widescreen.
+    j["web_widescreen_default"] = true;
+#endif
     // dump() throws only for a string that is not valid UTF-8; the key
     // names above came through the parser or are this file's own.
     std::string text = j.dump(2);
