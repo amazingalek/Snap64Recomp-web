@@ -1,9 +1,9 @@
 # The web page
 
 This fork's `main` branch also builds with [Emscripten](https://emscripten.org) into a page, `Snap64Recomp.html`,
-that draws through WebGPU: **https://amazingalek.github.io/Snap64Recomp-web/**. The game's code is recompiled from the
+that draws through WebGPU: **https://n64hub.com/pokemon-snap/**. The game's code is recompiled from the
 Pokémon Snap decompilation's ELF of the US ROM, as the desktop build's is, and
-[N64Recomp-browser](https://github.com/amazingalek/N64Recomp-browser) (`lib/N64Recomp-browser`) patches RT64, plume,
+[N64Recomp-browser](https://github.com/n64hub/N64Recomp-browser) (`lib/N64Recomp-browser`) patches RT64, plume,
 hlslpp, N64ModernRuntime and N64Recomp with the web support and makes the game a page. Everything the page needs is
 behind `__EMSCRIPTEN__` or `if(EMSCRIPTEN)` (`CMakeLists.txt` includes `web/page.cmake` in place of the rest of
 itself), so the desktop builds are unchanged.
