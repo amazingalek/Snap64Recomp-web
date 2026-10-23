@@ -11,7 +11,7 @@
 #    web's change to those (patches/web/files.txt) is patches/web/<name>.patch instead, written on top of Snap64
 #    Recomp's from the N64Recomp-browser commit patches/web/files.txt names, with what the web has changed in them
 #    since merged in by apply.cmake --since (only a change that meets the port's own lines stops the build, for
-#    another merge by hand). Patched from clean whenever lib/N64Recomp-browser or patches/web moved since the last time, which build-web-prep/web-patched records: apply.cmake can't take a checkout from one
+#    another merge by hand). Patched from clean whenever lib/N64Recomp-browser, patches/web or the commit of rt64 or the runtime moved since the last time, which build-web-prep/web-patched records (a sync that moves a submodule resets it, so its patches have to go on again): apply.cmake can't take a checkout from one
 #    version of its patches to another.
 #      rt64: what both add beside each other (the rect and primitive colour matching beside the CPU hot paths' call
 #      hash map, the shader blob cache beside the WGSL cache and the prebuilt shaders, the swap chain's vsync beside
@@ -61,7 +61,7 @@ plume lib/rt64/src/contrib/plume
 hlslpp lib/rt64/src/contrib/hlslpp
 N64ModernRuntime lib/N64ModernRuntime $(shared N64ModernRuntime)
 N64Recomp lib/N64ModernRuntime/N64Recomp"
-stamp="$(git -C $browser rev-parse HEAD) $( (cat patches/web/*.patch patches/web/files.txt; echo "$web_patches") | sha1sum | cut -c1-40)"
+stamp="$(git -C $browser rev-parse HEAD) $(git -C lib/rt64 rev-parse HEAD) $(git -C lib/N64ModernRuntime rev-parse HEAD) $( (cat patches/web/*.patch patches/web/files.txt; echo "$web_patches") | sha1sum | cut -c1-40)"
 if [[ "$(cat $prep/web-patched 2> /dev/null)" != "$stamp" ]]; then
     for s in lib/rt64 lib/N64ModernRuntime; do
         git -C $s submodule foreach --recursive -q 'git reset -q --hard && git clean -fdq'
